@@ -12,6 +12,10 @@ It does not replace the classroom `robot-console`. Its job is to manage the extr
 
 - Separate project and service name: `robot-console-ai`
 - Admin page controls for local AI services only
+- Admin page can also:
+  - run tests
+  - git sync the repo
+  - restart `robot-console-ai`
 - Deploy assets for:
   - `robot-console-ai.service`
   - `hailo-ollama.service`
@@ -131,6 +135,15 @@ sudo systemctl daemon-reload
 sudo systemctl enable robot-console-ai
 sudo systemctl enable hailo-ollama
 ```
+
+### 6. Update/restart helper scripts
+
+The bootstrap script also installs:
+
+- `/opt/robot/bin/robot-console-ai-update`
+- `/opt/robot/bin/robot-console-ai-restart`
+
+Those are what the Admin page uses for self-update and restart.
 
 ## Service files included
 

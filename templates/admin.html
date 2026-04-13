@@ -15,6 +15,10 @@
         <div><a href="/admin">/admin</a></div>
         <div><a href="/logs">/logs</a></div>
         <div class="mt-3">
+          <button id="btnRunTests" class="btn btn-outline-success btn-sm" type="button">Run Tests</button>
+          <button id="btnUpdateRestart" class="btn btn-danger btn-sm" type="button">Git Sync + Restart</button>
+        </div>
+        <div class="mt-2">
           <button id="btnRefreshServices" class="btn btn-outline-primary btn-sm" type="button">Refresh Status</button>
           <button id="btnRefreshConfig" class="btn btn-outline-secondary btn-sm" type="button">View Config</button>
         </div>
@@ -56,6 +60,9 @@
 <script>
 (async function () {
   const out = document.getElementById('adminOut');
+  const btnRunTests = document.getElementById('btnRunTests');
+  const btnUpdateRestart = document.getElementById('btnUpdateRestart');
+  let updatePollTimer = null;
 
   function show(v) {
     if (!out) return;
@@ -92,6 +99,33 @@
     (j.services || []).forEach(renderService);
   }
 
+  function pollPostUpdate(baseOut) {
+    if (updatePollTimer) clearInterval(updatePollTimer);
+    const tick = async () => {
+      try {
+        const r = await fetch('/api/admin/update-tests/status', { credentials: 'same-origin', cache: 'no-store' });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.ok) return;
+        const tail = j.log_tail || '';
+        let msg = `${baseOut}\n\n--- Post-update (restart + tests) ---\n${tail}`;
+        if (j.done) {
+          const rc = typeof j.returncode === 'number' ? j.returncode : 'unknown';
+          msg += `\n\nResult: ${rc === 0 ? 'PASS' : 'FAIL'} (rc=${rc})`;
+          if (typeof j.restart_returncode === 'number') {
+            msg += `\nRestart: ${j.restart_returncode === 0 ? 'OK' : 'FAIL'} (rc=${j.restart_returncode})`;
+          }
+          clearInterval(updatePollTimer);
+          updatePollTimer = null;
+        }
+        show(msg);
+      } catch (e) {
+        show(`${baseOut}\n\n(post-update status error)\n${String(e)}`);
+      }
+    };
+    tick();
+    updatePollTimer = setInterval(tick, 1200);
+  }
+
   document.getElementById('btnRefreshServices')?.addEventListener('click', async () => {
     show('Refreshing AI service status...');
     await refreshServices();
@@ -102,6 +136,49 @@
     const r = await fetch('/api/admin/config', { credentials: 'same-origin', cache: 'no-store' });
     const j = await r.json().catch(() => ({}));
     show(j);
+  });
+
+  btnRunTests?.addEventListener('click', async () => {
+    btnRunTests.disabled = true;
+    show('Starting tests...');
+    try {
+      const r = await fetch('/api/admin/tests/run', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+      });
+      const j = await r.json().catch(() => ({}));
+      const baseOut = JSON.stringify(j, null, 2) || `(request failed: ${r.status})`;
+      show(baseOut);
+      if (r.ok && j.tests && j.tests.queued) {
+        pollPostUpdate(baseOut);
+      }
+    } finally {
+      btnRunTests.disabled = false;
+    }
+  });
+
+  btnUpdateRestart?.addEventListener('click', async () => {
+    if (!confirm('This will git sync and restart robot-console-ai. Continue?')) return;
+    btnUpdateRestart.disabled = true;
+    show('Running update...');
+    try {
+      const r = await fetch('/api/admin/update-restart', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+      });
+      const j = await r.json().catch(() => ({}));
+      const baseOut = JSON.stringify(j, null, 2) || `(request failed: ${r.status})`;
+      show(baseOut);
+      if (r.ok && j.post_update && j.post_update.queued) {
+        pollPostUpdate(baseOut);
+      }
+    } finally {
+      btnUpdateRestart.disabled = false;
+    }
   });
 
   document.querySelectorAll('.btn-svc').forEach((button) => {

@@ -54,6 +54,10 @@ APP_TITLE = os.environ.get("ROBOT_CONSOLE_AI_TITLE", "Robot Console AI").strip()
 APP_SERVICE_NAME = os.environ.get("ROBOT_CONSOLE_AI_SERVICE", "robot-console-ai").strip() or "robot-console-ai"
 APP_PORT = int(os.environ.get("ROBOT_CONSOLE_AI_PORT", "8080"))
 APP_REPO_DIR = Path(os.environ.get("ROBOT_CONSOLE_AI_REPO_DIR", str(APP_DIR))).expanduser()
+APP_UPDATE_SCRIPT = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_SCRIPT", "/opt/robot/bin/robot-console-ai-update")).expanduser()
+APP_RESTART_SCRIPT = Path(os.environ.get("ROBOT_CONSOLE_AI_RESTART_SCRIPT", "/opt/robot/bin/robot-console-ai-restart")).expanduser()
+UPDATE_TEST_LOG_PATH = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_TEST_LOG_PATH", "/tmp/robot-console-ai-update-tests.log")).expanduser()
+UPDATE_TEST_RC_PATH = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_TEST_RC_PATH", "/tmp/robot-console-ai-update-tests.rc")).expanduser()
 PASS_HASH_FILE = Path(os.environ.get("PASS_HASH_FILE", "/opt/robot/etc/robot-console-ai.passhash")).expanduser()
 PASS_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_USER = os.environ.get("RCAI_USER", "admin").strip() or "admin"
@@ -154,6 +158,122 @@ def _systemctl_run(args: List[str], timeout: float = 20.0) -> Dict[str, Any]:
         }
     except Exception as exc:
         return {"ok": False, "cmd": " ".join(shlex.quote(x) for x in cmd), "error": str(exc)}
+
+
+def _tail_text(path: Path, max_lines: int = 120) -> str:
+    try:
+        txt = path.read_text(errors="ignore")
+    except Exception:
+        return ""
+    lines = txt.splitlines()
+    if len(lines) <= max_lines:
+        return txt
+    return "\n".join(lines[-max_lines:])
+
+
+def _git_pull_ff_only(repo_dir: Path) -> Dict[str, Any]:
+    if APP_UPDATE_SCRIPT.exists():
+        cmd = [str(APP_UPDATE_SCRIPT)] if os.access(APP_UPDATE_SCRIPT, os.X_OK) else ["sh", str(APP_UPDATE_SCRIPT)]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
+            return {
+                "ok": p.returncode == 0,
+                "mode": "script",
+                "cmd": " ".join(shlex.quote(x) for x in cmd),
+                "stdout": (p.stdout or "").strip(),
+                "stderr": (p.stderr or "").strip(),
+                "returncode": p.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "mode": "script", "error": "update_script_timeout", "cmd": str(APP_UPDATE_SCRIPT)}
+        except Exception as exc:
+            return {"ok": False, "mode": "script", "error": str(exc), "cmd": str(APP_UPDATE_SCRIPT)}
+
+    cmd = ["git", "-C", str(repo_dir), "pull", "--ff-only"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+        return {
+            "ok": p.returncode == 0,
+            "mode": "git",
+            "cmd": " ".join(shlex.quote(x) for x in cmd),
+            "stdout": (p.stdout or "").strip(),
+            "stderr": (p.stderr or "").strip(),
+            "returncode": p.returncode,
+        }
+    except Exception as exc:
+        return {"ok": False, "mode": "git", "error": str(exc), "cmd": " ".join(shlex.quote(x) for x in cmd)}
+
+
+def _restart_command_shell(service_name: str) -> tuple[str, str]:
+    svc = (service_name or "").strip() or APP_SERVICE_NAME
+    pid = os.getpid()
+    kill_cmd = f"kill -TERM {pid}"
+    if APP_RESTART_SCRIPT.exists():
+        q_script = shlex.quote(str(APP_RESTART_SCRIPT))
+        run_script = q_script if os.access(APP_RESTART_SCRIPT, os.X_OK) else f"sh {q_script}"
+        return f"({run_script} || {kill_cmd})", "script_or_self_kill"
+    q_svc = shlex.quote(svc)
+    return f"(systemctl restart {q_svc} || sudo -n systemctl restart {q_svc} || {kill_cmd})", "systemctl_or_self_kill"
+
+
+def _start_post_update_tasks_detached(repo_dir: Path, service_name: str) -> Dict[str, Any]:
+    q_repo = shlex.quote(str(repo_dir))
+    q_log = shlex.quote(str(UPDATE_TEST_LOG_PATH))
+    q_rc = shlex.quote(str(UPDATE_TEST_RC_PATH))
+    restart_cmd, restart_mode = _restart_command_shell(service_name)
+    test_cmd = (
+        "if command -v pytest >/dev/null 2>&1; then pytest -q; "
+        "elif python3 -c 'import pytest' >/dev/null 2>&1; then python3 -m pytest -q; "
+        "else python3 -m unittest discover -s tests -p 'test_*.py'; fi"
+    )
+    script = (
+        "set +e; "
+        f"rm -f {q_rc}; : > {q_log}; "
+        f"cd {q_repo}; "
+        f"echo '$ {test_cmd}' >> {q_log}; "
+        f"{test_cmd} >> {q_log} 2>&1; "
+        "trc=$?; "
+        f"echo \"$trc\" > {q_rc}; "
+        f"echo \"tests_rc=$trc\" >> {q_log}; "
+        f"echo \"restart_mode={restart_mode}\" >> {q_log}; "
+        f"echo '$ {restart_cmd}' >> {q_log}; "
+        f"{restart_cmd} >> {q_log} 2>&1; "
+        "rst=$?; "
+        f"echo \"restart_rc=$rst\" >> {q_log}; "
+        "exit 0"
+    )
+    try:
+        p = subprocess.Popen(["sh", "-lc", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return {"ok": True, "queued": True, "pid": p.pid, "cmd": "sh -lc <post-update-script>"}
+    except Exception as exc:
+        return {"ok": False, "queued": False, "error": str(exc), "cmd": "sh -lc <post-update-script>"}
+
+
+def _start_tests_only_detached(repo_dir: Path) -> Dict[str, Any]:
+    q_repo = shlex.quote(str(repo_dir))
+    q_log = shlex.quote(str(UPDATE_TEST_LOG_PATH))
+    q_rc = shlex.quote(str(UPDATE_TEST_RC_PATH))
+    test_cmd = (
+        "if command -v pytest >/dev/null 2>&1; then pytest -q; "
+        "elif python3 -c 'import pytest' >/dev/null 2>&1; then python3 -m pytest -q; "
+        "else python3 -m unittest discover -s tests -p 'test_*.py'; fi"
+    )
+    script = (
+        "set +e; "
+        f"rm -f {q_rc}; : > {q_log}; "
+        f"cd {q_repo}; "
+        f"echo '$ {test_cmd}' >> {q_log}; "
+        f"{test_cmd} >> {q_log} 2>&1; "
+        "trc=$?; "
+        f"echo \"$trc\" > {q_rc}; "
+        f"echo \"tests_rc=$trc\" >> {q_log}; "
+        "exit 0"
+    )
+    try:
+        p = subprocess.Popen(["sh", "-lc", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return {"ok": True, "queued": True, "pid": p.pid, "cmd": "sh -lc <tests-only-script>"}
+    except Exception as exc:
+        return {"ok": False, "queued": False, "error": str(exc), "cmd": "sh -lc <tests-only-script>"}
 
 
 def _service_health(url: str) -> Dict[str, Any]:
@@ -337,6 +457,78 @@ def api_admin_config():
             "services": AI_SERVICES,
         }
     )
+
+
+@APP.post("/api/admin/update-restart")
+@need_login
+def api_admin_update_restart():
+    repo_dir = APP_REPO_DIR
+    if not (repo_dir / ".git").exists():
+        return jsonify({"ok": False, "error": "repo_not_found", "repo_dir": str(repo_dir)}), 400
+    pull = _git_pull_ff_only(repo_dir)
+    if not pull.get("ok"):
+        return jsonify({"ok": False, "step": "git_pull", **pull}), 400
+    post_update = _start_post_update_tasks_detached(repo_dir, APP_SERVICE_NAME)
+    return jsonify({
+        "ok": bool(post_update.get("ok")),
+        "step": "post_update_queued" if post_update.get("ok") else "post_update_failed",
+        "repo_dir": str(repo_dir),
+        "service": APP_SERVICE_NAME,
+        "git": pull,
+        "post_update": post_update,
+        "hint": f"If restart fails, allow this user to run: sudo -n systemctl restart {APP_SERVICE_NAME}",
+    }), (200 if post_update.get("ok") else 500)
+
+
+@APP.get("/api/admin/update-tests/status")
+@need_login
+def api_admin_update_tests_status():
+    rc = -1
+    try:
+        rc = int((UPDATE_TEST_RC_PATH.read_text() or "-1").strip())
+    except Exception:
+        rc = -1
+
+    started = UPDATE_TEST_RC_PATH.exists() or UPDATE_TEST_LOG_PATH.exists()
+    full_log = ""
+    try:
+        full_log = UPDATE_TEST_LOG_PATH.read_text(errors="ignore")
+    except Exception:
+        full_log = ""
+
+    restart_rc = None
+    for ln in reversed(full_log.splitlines()):
+        if ln.startswith("restart_rc="):
+            try:
+                restart_rc = int((ln.split("=", 1)[1] or "").strip())
+            except Exception:
+                restart_rc = None
+            break
+
+    return jsonify({
+        "ok": True,
+        "started": started,
+        "running": started and rc == -1,
+        "done": started and rc != -1,
+        "returncode": None if rc == -1 else rc,
+        "restart_returncode": restart_rc,
+        "log_tail": _tail_text(UPDATE_TEST_LOG_PATH, max_lines=120),
+    })
+
+
+@APP.post("/api/admin/tests/run")
+@need_login
+def api_admin_tests_run():
+    repo_dir = APP_REPO_DIR
+    if not (repo_dir / ".git").exists():
+        return jsonify({"ok": False, "error": "repo_not_found", "repo_dir": str(repo_dir)}), 400
+    run = _start_tests_only_detached(repo_dir)
+    return jsonify({
+        "ok": bool(run.get("ok")),
+        "step": "tests_queued" if run.get("ok") else "tests_failed_to_queue",
+        "repo_dir": str(repo_dir),
+        "tests": run,
+    }), (200 if run.get("ok") else 500)
 
 
 if __name__ == "__main__":

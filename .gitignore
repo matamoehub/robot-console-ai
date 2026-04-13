@@ -29,3 +29,5 @@ lessons_bundles/*.sha256
 classes.json
 lessons_state.json
 robots.json
+
+!.env.example
