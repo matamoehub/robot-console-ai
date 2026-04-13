@@ -1,0 +1,13 @@
+[Unit]
+Description=Open WebUI for Hailo Ollama
+After=network-online.target docker.service hailo-ollama.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker run -d --rm --name open-webui -p 3000:8080 -e OLLAMA_BASE_URL=http://127.0.0.1:8000 ghcr.io/open-webui/open-webui:main
+ExecStop=/usr/bin/docker stop open-webui
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime/cache
+*.sqlite
+*.db
+/tmp/
+run/
+
+# Generated lesson bundle artifacts
+lessons_bundles/*.tar.gz
+lessons_bundles/*.sha256
+
+# Instance-local runtime state
+classes.json
+lessons_state.json
+robots.json

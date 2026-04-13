@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Logs · {{ app_title }}{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-body">
+    <div class="row g-2 align-items-end mb-3">
+      <div class="col-12 col-md-4">
+        <label class="form-label">Service</label>
+        <select id="serviceSelect" class="form-select">
+          {% for svc in ai_services %}
+            <option value="{{ svc.key }}" {% if request.args.get('service') == svc.key %}selected{% endif %}>{{ svc.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-12 col-md-2">
+        <label class="form-label">Lines</label>
+        <input id="lineCount" class="form-control" type="number" value="120" min="10" max="500">
+      </div>
+      <div class="col-12 col-md-3 d-flex gap-2">
+        <button id="btnLoadLogs" class="btn btn-primary" type="button">Load Logs</button>
+      </div>
+    </div>
+    <pre id="logOut" class="mono small mb-0" style="white-space: pre-wrap; min-height: 50vh;">(no logs loaded yet)</pre>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+(async function () {
+  const out = document.getElementById('logOut');
+  const serviceSelect = document.getElementById('serviceSelect');
+  const lineCount = document.getElementById('lineCount');
+
+  async function loadLogs() {
+    const key = serviceSelect?.value || '';
+    const lines = lineCount?.value || '120';
+    out.textContent = `Loading logs for ${key}...`;
+    const r = await fetch(`/api/admin/logs/${encodeURIComponent(key)}?lines=${encodeURIComponent(lines)}`, {
+      credentials: 'same-origin',
+      cache: 'no-store'
+    });
+    const j = await r.json().catch(() => ({}));
+    out.textContent = JSON.stringify(j, null, 2);
+  }
+
+  document.getElementById('btnLoadLogs')?.addEventListener('click', loadLogs);
+  await loadLogs();
+})();
+</script>
+{% endblock %}

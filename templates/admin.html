@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}Admin · {{ app_title }}{% endblock %}
+{% block content %}
+<div class="row g-3">
+  <div class="col-12 col-xl-4">
+    <div class="card h-100">
+      <div class="card-body">
+        <div class="fw-semibold mb-2">Service</div>
+        <div class="mono">{{ service_name }}</div>
+        <div class="fw-semibold mt-3 mb-2">Repository</div>
+        <div class="mono small">{{ repo_dir }}</div>
+        <div class="fw-semibold mt-3 mb-2">Port</div>
+        <div class="mono">8080</div>
+        <div class="fw-semibold mt-3 mb-2">Pages</div>
+        <div><a href="/admin">/admin</a></div>
+        <div><a href="/logs">/logs</a></div>
+        <div class="mt-3">
+          <button id="btnRefreshServices" class="btn btn-outline-primary btn-sm" type="button">Refresh Status</button>
+          <button id="btnRefreshConfig" class="btn btn-outline-secondary btn-sm" type="button">View Config</button>
+        </div>
+        <pre id="adminOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap;">(no action yet)</pre>
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-xl-8">
+    <div class="card h-100">
+      <div class="card-body">
+        <div class="fw-semibold mb-3">Local AI Services</div>
+        <div class="row g-3">
+          {% for svc in ai_services %}
+            <div class="col-12 col-md-6">
+              <div class="border rounded p-3 h-100">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                  <div class="fw-semibold">{{ svc.label }}</div>
+                  <span id="svcBadge-{{ svc.key }}" class="badge text-bg-secondary">Loading…</span>
+                </div>
+                <div class="small text-muted mb-2">{{ svc.description }}</div>
+                <div class="small text-muted mb-2">systemd: <span class="mono">{{ svc.service_name }}</span></div>
+                <div class="small text-muted mb-3">Status: <span id="svcMeta-{{ svc.key }}">(loading…)</span></div>
+                <div class="d-flex gap-2 flex-wrap">
+                  <button class="btn btn-outline-success btn-sm btn-svc" data-key="{{ svc.key }}" data-action="start" type="button">Start</button>
+                  <button class="btn btn-outline-secondary btn-sm btn-svc" data-key="{{ svc.key }}" data-action="stop" type="button">Stop</button>
+                  <button class="btn btn-outline-primary btn-sm btn-svc" data-key="{{ svc.key }}" data-action="restart" type="button">Restart</button>
+                  <a class="btn btn-outline-dark btn-sm" href="/logs?service={{ svc.key }}">Logs</a>
+                </div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+(async function () {
+  const out = document.getElementById('adminOut');
+
+  function show(v) {
+    if (!out) return;
+    out.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  }
+
+  function renderService(svc) {
+    const badge = document.getElementById(`svcBadge-${svc.key}`);
+    const meta = document.getElementById(`svcMeta-${svc.key}`);
+    if (badge) {
+      const active = String(svc.active_state || '').toLowerCase() === 'active';
+      badge.className = 'badge ' + (active ? 'text-bg-success' : 'text-bg-secondary');
+      badge.textContent = active ? 'Running' : (svc.active_state || 'Stopped');
+    }
+    if (meta) {
+      const parts = [];
+      if (svc.active_state) parts.push(`active=${svc.active_state}`);
+      if (svc.sub_state) parts.push(`sub=${svc.sub_state}`);
+      if (svc.unit_file_state) parts.push(`enabled=${svc.unit_file_state}`);
+      if (svc.health && svc.health.configured) {
+        parts.push(svc.health.ok ? `health ok (${svc.health.status_code || 200})` : `health fail${svc.health.status_code ? ` (${svc.health.status_code})` : ''}`);
+      }
+      meta.textContent = parts.join(' · ') || '(no status)';
+    }
+  }
+
+  async function refreshServices() {
+    const r = await fetch('/api/admin/services', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      show(j || { error: `HTTP ${r.status}` });
+      return;
+    }
+    (j.services || []).forEach(renderService);
+  }
+
+  document.getElementById('btnRefreshServices')?.addEventListener('click', async () => {
+    show('Refreshing AI service status...');
+    await refreshServices();
+    show('Service status refreshed.');
+  });
+
+  document.getElementById('btnRefreshConfig')?.addEventListener('click', async () => {
+    const r = await fetch('/api/admin/config', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    show(j);
+  });
+
+  document.querySelectorAll('.btn-svc').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const key = button.dataset.key;
+      const action = button.dataset.action;
+      button.disabled = true;
+      show(`Running ${action} on ${key}...`);
+      try {
+        const r = await fetch(`/api/admin/services/${encodeURIComponent(key)}/${encodeURIComponent(action)}`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        const j = await r.json().catch(() => ({}));
+        show(j);
+        await refreshServices();
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+
+  await refreshServices();
+})();
+</script>
+{% endblock %}

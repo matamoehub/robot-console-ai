@@ -1,0 +1,18 @@
+[Unit]
+Description=Matamoe Robot Console AI (Flask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=matamoe
+WorkingDirectory=/opt/robot/robot-console-ai
+EnvironmentFile=-/opt/robot/robot-console-ai/.env
+Environment=FLASK_APP=app.py
+Environment=FLASK_RUN_PORT=8080
+ExecStart=/opt/robot/robot-console-ai/.venv/bin/flask run --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=2
+StandardOutput=file:/opt/robot/logs/robot-console-ai-stdout.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Hailo Ollama Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matamoe
+WorkingDirectory=/opt/robot
+Environment=HOME=/home/matamoe
+ExecStart=/usr/bin/env hailo-ollama
+Restart=always
+RestartSec=2
+StandardOutput=append:/opt/robot/logs/hailo-ollama.log
+StandardError=append:/opt/robot/logs/hailo-ollama.log
+
+[Install]
+WantedBy=multi-user.target

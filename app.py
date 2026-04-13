@@ -1,0 +1,343 @@
+import json
+import os
+import secrets
+import shlex
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List
+
+from flask import Flask, flash, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
+
+APP_DIR = Path(__file__).resolve().parent
+APP = Flask(__name__, static_folder="static", template_folder="templates")
+APP.secret_key = os.environ.get("FLASK_SECRET", "robot-console-ai-local-only")
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+for candidate in (
+    Path("/opt/robot/etc/robot-console-ai.env"),
+    Path("/etc/robot-console-ai/robot-console-ai.env"),
+    APP_DIR / ".env",
+):
+    try:
+        _load_env_file(candidate)
+    except Exception:
+        pass
+
+
+def _load_version() -> str:
+    env_version = (os.environ.get("ROBOT_CONSOLE_AI_VERSION") or "").strip()
+    if env_version:
+        return env_version
+    version_file = APP_DIR / "VERSION"
+    if version_file.exists():
+        return (version_file.read_text(encoding="utf-8") or "1.0").strip() or "1.0"
+    return "1.0"
+
+
+APP_VERSION = _load_version()
+APP_TITLE = os.environ.get("ROBOT_CONSOLE_AI_TITLE", "Robot Console AI").strip() or "Robot Console AI"
+APP_SERVICE_NAME = os.environ.get("ROBOT_CONSOLE_AI_SERVICE", "robot-console-ai").strip() or "robot-console-ai"
+APP_PORT = int(os.environ.get("ROBOT_CONSOLE_AI_PORT", "8080"))
+APP_REPO_DIR = Path(os.environ.get("ROBOT_CONSOLE_AI_REPO_DIR", str(APP_DIR))).expanduser()
+PASS_HASH_FILE = Path(os.environ.get("PASS_HASH_FILE", "/opt/robot/etc/robot-console-ai.passhash")).expanduser()
+PASS_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
+ADMIN_USER = os.environ.get("RCAI_USER", "admin").strip() or "admin"
+if not PASS_HASH_FILE.exists():
+    PASS_HASH_FILE.write_text(generate_password_hash(secrets.token_urlsafe(24)))
+PASS_HASH = PASS_HASH_FILE.read_text().strip()
+
+
+DEFAULT_AI_SERVICES = [
+    {
+        "key": "hailo-ollama",
+        "label": "Hailo Ollama",
+        "service_name": os.environ.get("HAILO_OLLAMA_SERVICE", "hailo-ollama").strip() or "hailo-ollama",
+        "health_url": os.environ.get("HAILO_OLLAMA_HEALTH_URL", "http://127.0.0.1:8000/hailo/v1/list").strip(),
+        "description": "Primary LLM backend for the AI HAT+ 2.",
+        "journal_unit": os.environ.get("HAILO_OLLAMA_SERVICE", "hailo-ollama").strip() or "hailo-ollama",
+        "control_script": os.environ.get("HAILO_OLLAMA_CONTROL_SCRIPT", "").strip(),
+    },
+    {
+        "key": "vlm-service",
+        "label": "VLM Service",
+        "service_name": os.environ.get("VLM_SERVICE_NAME", "vlm-service").strip() or "vlm-service",
+        "health_url": os.environ.get("VLM_HEALTH_URL", "").strip(),
+        "description": "Optional local vision-language service running on this Pi.",
+        "journal_unit": os.environ.get("VLM_SERVICE_NAME", "vlm-service").strip() or "vlm-service",
+        "control_script": os.environ.get("VLM_CONTROL_SCRIPT", "").strip(),
+    },
+    {
+        "key": "open-webui",
+        "label": "Open WebUI",
+        "service_name": os.environ.get("OPEN_WEBUI_SERVICE", "open-webui").strip() or "open-webui",
+        "health_url": os.environ.get("OPEN_WEBUI_HEALTH_URL", "http://127.0.0.1:3000").strip(),
+        "description": "Optional browser UI that talks to the Ollama backend.",
+        "journal_unit": os.environ.get("OPEN_WEBUI_SERVICE", "open-webui").strip() or "open-webui",
+        "control_script": os.environ.get("OPEN_WEBUI_CONTROL_SCRIPT", "").strip(),
+    },
+]
+
+
+def _load_ai_services() -> List[Dict[str, Any]]:
+    raw = (os.environ.get("AI_LOCAL_SERVICES_JSON") or "").strip()
+    if not raw:
+        return DEFAULT_AI_SERVICES
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return DEFAULT_AI_SERVICES
+    if not isinstance(data, list):
+        return DEFAULT_AI_SERVICES
+    out: List[Dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        service_name = str(item.get("service_name") or "").strip()
+        if not key or not service_name:
+            continue
+        out.append(
+            {
+                "key": key,
+                "label": str(item.get("label") or key).strip(),
+                "service_name": service_name,
+                "health_url": str(item.get("health_url") or "").strip(),
+                "description": str(item.get("description") or "").strip(),
+                "journal_unit": str(item.get("journal_unit") or service_name).strip(),
+                "control_script": str(item.get("control_script") or "").strip(),
+            }
+        )
+    return out or DEFAULT_AI_SERVICES
+
+
+AI_SERVICES = _load_ai_services()
+AI_SERVICE_MAP = {svc["key"]: svc for svc in AI_SERVICES}
+
+
+def need_login(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def wrap(*args, **kwargs):
+        if session.get("user") != ADMIN_USER:
+            return redirect(url_for("login_page", next=request.path))
+        return fn(*args, **kwargs)
+
+    return wrap
+
+
+def _systemctl_run(args: List[str], timeout: float = 20.0) -> Dict[str, Any]:
+    cmd = ["systemctl", *args]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return {
+            "ok": p.returncode == 0,
+            "cmd": " ".join(shlex.quote(x) for x in cmd),
+            "returncode": p.returncode,
+            "stdout": (p.stdout or "").strip(),
+            "stderr": (p.stderr or "").strip(),
+        }
+    except Exception as exc:
+        return {"ok": False, "cmd": " ".join(shlex.quote(x) for x in cmd), "error": str(exc)}
+
+
+def _service_health(url: str) -> Dict[str, Any]:
+    target = (url or "").strip()
+    if not target:
+        return {"configured": False, "ok": False}
+    try:
+        import requests
+        r = requests.get(target, timeout=4.0)
+        return {"configured": True, "ok": r.ok, "status_code": r.status_code, "url": target}
+    except Exception as exc:
+        return {"configured": True, "ok": False, "url": target, "error": str(exc)}
+
+
+def _service_status(item: Dict[str, Any]) -> Dict[str, Any]:
+    service_name = item["service_name"]
+    show = _systemctl_run([
+        "show",
+        service_name,
+        "--property=Id,LoadState,ActiveState,SubState,UnitFileState,FragmentPath",
+        "--no-pager",
+    ], timeout=8.0)
+    props: Dict[str, str] = {}
+    for line in (show.get("stdout") or "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            props[key] = value
+    return {
+        "key": item["key"],
+        "label": item["label"],
+        "service_name": service_name,
+        "description": item.get("description") or "",
+        "health": _service_health(item.get("health_url") or ""),
+        "load_state": props.get("LoadState") or "",
+        "active_state": props.get("ActiveState") or "",
+        "sub_state": props.get("SubState") or "",
+        "unit_file_state": props.get("UnitFileState") or "",
+        "fragment_path": props.get("FragmentPath") or "",
+        "available": (props.get("LoadState") or "") not in ("", "not-found"),
+        "control_script": item.get("control_script") or "",
+    }
+
+
+def _service_action(item: Dict[str, Any], action: str) -> Dict[str, Any]:
+    op = (action or "").strip().lower()
+    if op not in {"start", "stop", "restart"}:
+        return {"ok": False, "error": "unsupported_action"}
+    control_script = (item.get("control_script") or "").strip()
+    if control_script:
+        cmd = [control_script, op]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=30.0, check=False)
+            result = {
+                "ok": p.returncode == 0,
+                "cmd": " ".join(shlex.quote(x) for x in cmd),
+                "returncode": p.returncode,
+                "stdout": (p.stdout or "").strip(),
+                "stderr": (p.stderr or "").strip(),
+            }
+        except Exception as exc:
+            result = {"ok": False, "cmd": " ".join(shlex.quote(x) for x in cmd), "error": str(exc)}
+    else:
+        result = _systemctl_run([op, item["service_name"]], timeout=30.0)
+    return {
+        "ok": bool(result.get("ok")),
+        "action": op,
+        "service_name": item["service_name"],
+        "result": result,
+        "status": _service_status(item),
+    }
+
+
+def _service_logs(item: Dict[str, Any], lines: int = 120) -> Dict[str, Any]:
+    lines = max(10, min(int(lines), 500))
+    cmd = ["journalctl", "-u", item.get("journal_unit") or item["service_name"], "-n", str(lines), "--no-pager"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=12.0, check=False)
+        return {
+            "ok": p.returncode == 0,
+            "cmd": " ".join(shlex.quote(x) for x in cmd),
+            "returncode": p.returncode,
+            "stdout": (p.stdout or "").strip(),
+            "stderr": (p.stderr or "").strip(),
+        }
+    except Exception as exc:
+        return {"ok": False, "cmd": " ".join(shlex.quote(x) for x in cmd), "error": str(exc)}
+
+
+@APP.context_processor
+def inject_context() -> Dict[str, Any]:
+    return {"app_version": APP_VERSION, "app_title": APP_TITLE}
+
+
+@APP.get("/")
+def home():
+    return redirect(url_for("admin_page"))
+
+
+@APP.get("/login")
+def login_page():
+    return render_template("login.html")
+
+
+@APP.post("/login")
+def login():
+    user = request.form.get("username", "")
+    password = request.form.get("password", "")
+    if user == ADMIN_USER and check_password_hash(PASS_HASH, password):
+        session["user"] = ADMIN_USER
+        return redirect(request.args.get("next") or url_for("admin_page"))
+    flash("Invalid username or password", "danger")
+    return render_template("login.html"), 401
+
+
+@APP.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login_page"))
+
+
+@APP.get("/api/version")
+def api_version():
+    return jsonify({"ok": True, "app": "robot-console-ai", "version": APP_VERSION, "port": APP_PORT})
+
+
+@APP.get("/admin")
+@need_login
+def admin_page():
+    return render_template(
+        "admin.html",
+        service_name=APP_SERVICE_NAME,
+        repo_dir=str(APP_REPO_DIR),
+        ai_services=AI_SERVICES,
+    )
+
+
+@APP.get("/logs")
+@need_login
+def logs_page():
+    return render_template("logs.html", ai_services=AI_SERVICES)
+
+
+@APP.get("/api/admin/services")
+@need_login
+def api_admin_services():
+    return jsonify({"ok": True, "services": [_service_status(item) for item in AI_SERVICES]})
+
+
+@APP.post("/api/admin/services/<service_key>/<action>")
+@need_login
+def api_admin_service_action(service_key: str, action: str):
+    item = AI_SERVICE_MAP.get((service_key or "").strip())
+    if not item:
+        return jsonify({"ok": False, "error": "unknown_service"}), 404
+    result = _service_action(item, action)
+    return jsonify(result), (200 if result.get("ok") else 500)
+
+
+@APP.get("/api/admin/logs/<service_key>")
+@need_login
+def api_admin_logs(service_key: str):
+    item = AI_SERVICE_MAP.get((service_key or "").strip())
+    if not item:
+        return jsonify({"ok": False, "error": "unknown_service"}), 404
+    lines = request.args.get("lines", "120")
+    result = _service_logs(item, int(lines))
+    return jsonify({"ok": bool(result.get("ok")), "service": item, "logs": result}), (200 if result.get("ok") else 500)
+
+
+@APP.get("/api/admin/config")
+@need_login
+def api_admin_config():
+    return jsonify(
+        {
+            "ok": True,
+            "title": APP_TITLE,
+            "service_name": APP_SERVICE_NAME,
+            "repo_dir": str(APP_REPO_DIR),
+            "port": APP_PORT,
+            "pass_hash_file": str(PASS_HASH_FILE),
+            "services": AI_SERVICES,
+        }
+    )
+
+
+if __name__ == "__main__":
+    APP.run(host="0.0.0.0", port=APP_PORT, debug=False)
