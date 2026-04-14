@@ -85,7 +85,11 @@ ROBOT_TEXT_COMMAND_MODEL = (
 )
 ROBOT_BRAIN_API_TOKEN = (os.environ.get("ROBOT_BRAIN_API_TOKEN") or "").strip()
 TELEGRAM_EXECUTION_MODE = (os.environ.get("TELEGRAM_EXECUTION_MODE", "live").strip() or "live").lower()
+ROBOT_BRAIN_AUDIT_LOG = Path(
+    os.environ.get("ROBOT_BRAIN_AUDIT_LOG", "/opt/robot/logs/robot-brain-actions.log")
+).expanduser()
 PASS_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
+ROBOT_BRAIN_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_USER = os.environ.get("RCAI_USER", "admin").strip() or "admin"
 if not PASS_HASH_FILE.exists():
     PASS_HASH_FILE.write_text(generate_password_hash(secrets.token_urlsafe(24)))
@@ -346,6 +350,19 @@ def _http_json_request(method: str, url: str, *, payload: Dict[str, Any] | None 
         return {"ok": False, "url": url, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "error": str(exc)}
 
 
+def _audit_robot_action(event_type: str, payload: Dict[str, Any]) -> None:
+    entry = {
+        "ts": int(time.time()),
+        "event": str(event_type or "").strip() or "unknown",
+        "payload": payload,
+    }
+    try:
+        with ROBOT_BRAIN_AUDIT_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+
+
 def _api_token_ok(req) -> bool:
     expected = (ROBOT_BRAIN_API_TOKEN or "").strip()
     if not expected:
@@ -436,17 +453,58 @@ def _parse_robot_text_request(text: str, preferred_robot_id: str = "", use_llm: 
     rule_result = parse_text_command_plan(text, robots, preferred_robot_id=preferred_robot_id)
     if rule_result.get("intent", {}).get("action") != "unknown":
         rule_result["available_robots"] = robots
+        _audit_robot_action(
+            "parse",
+            {
+                "source": rule_result.get("source"),
+                "text": text,
+                "preferred_robot_id": preferred_robot_id,
+                "intent": rule_result.get("intent"),
+                "steps": rule_result.get("steps"),
+            },
+        )
         return rule_result
     if not use_llm:
         rule_result["available_robots"] = robots
+        _audit_robot_action(
+            "parse",
+            {
+                "source": rule_result.get("source"),
+                "text": text,
+                "preferred_robot_id": preferred_robot_id,
+                "intent": rule_result.get("intent"),
+                "steps": rule_result.get("steps"),
+            },
+        )
         return rule_result
     mode = _hailo_mode_status()
     if mode.get("active_mode") not in {"llm", "shared"}:
         rule_result["available_robots"] = robots
         rule_result["hint"] = "Switch Hailo mode to LLM for richer text-to-command parsing."
+        _audit_robot_action(
+            "parse",
+            {
+                "source": rule_result.get("source"),
+                "text": text,
+                "preferred_robot_id": preferred_robot_id,
+                "intent": rule_result.get("intent"),
+                "steps": rule_result.get("steps"),
+                "hint": rule_result.get("hint"),
+            },
+        )
         return rule_result
     llm_result = _parse_robot_text_with_llm(text, robots, preferred_robot_id=preferred_robot_id)
     llm_result["available_robots"] = robots
+    _audit_robot_action(
+        "parse",
+        {
+            "source": llm_result.get("source"),
+            "text": text,
+            "preferred_robot_id": preferred_robot_id,
+            "intent": llm_result.get("intent"),
+            "steps": llm_result.get("steps"),
+        },
+    )
     return llm_result
 
 
@@ -471,7 +529,7 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
                 }
             )
             overall_ok = overall_ok and bool(single_result.get("ok"))
-        return {
+        result = {
             "ok": overall_ok,
             "parsed": parsed,
             "step_results": step_results,
@@ -479,6 +537,8 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
             "target_count": len(step_results),
             "multi_step": True,
         }
+        _audit_robot_action("execute", result)
+        return result
 
     intent = parsed.get("intent") if isinstance(parsed.get("intent"), dict) else {}
     action = str(intent.get("action") or "").strip()
@@ -570,12 +630,14 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
             result = {"ok": False, "error": "unsupported_action", "action": action}
         results.append(result)
 
-    return {
+    result = {
         "ok": all(bool(item.get("ok")) for item in results),
         "parsed": parsed,
         "results": results,
         "target_count": len(results),
     }
+    _audit_robot_action("execute", result)
+    return result
 
 
 def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -584,7 +646,9 @@ def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: 
         return {"ok": False, "error": "invalid_mode", "mode": chosen_mode}
     parsed = _parse_robot_text_request(text, preferred_robot_id=robot_id, use_llm=True)
     if not parsed.get("ok"):
-        return {"ok": False, "mode": chosen_mode, "sender": sender or {}, "parsed": parsed}
+        result = {"ok": False, "mode": chosen_mode, "sender": sender or {}, "parsed": parsed}
+        _audit_robot_action("telegram", result)
+        return result
     payload = {
         "ok": True,
         "mode": chosen_mode,
@@ -599,10 +663,12 @@ def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: 
     }
     if chosen_mode == "test":
         payload["message"] = "Preview only. No robot command was executed."
+        _audit_robot_action("telegram", payload)
         return payload
     execution = _execute_robot_intent(parsed)
     payload["execution"] = execution
     payload["ok"] = bool(execution.get("ok"))
+    _audit_robot_action("telegram", payload)
     return payload
 
 

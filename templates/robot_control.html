@@ -139,6 +139,22 @@
     };
   }
 
+  function describeIntent(intent) {
+    const action = String((intent && intent.action) || 'unknown');
+    const args = (intent && intent.arguments) || {};
+    if (action === 'say') return `say: ${JSON.stringify(args.text || '')}`;
+    if (action === 'soundoff') return 'soundoff';
+    if (action === 'allstop') return 'allstop';
+    if (action === 'master_mode') return `master_mode: ${JSON.stringify(args.mode || '')}`;
+    if (action === 'camera_center') return 'camera: center';
+    if (action === 'camera_nod') return `camera_nod: depth=${JSON.stringify(args.depth)} speed_s=${JSON.stringify(args.speed_s)}`;
+    if (action === 'camera_shake') return `camera_shake: width=${JSON.stringify(args.width)} speed_s=${JSON.stringify(args.speed_s)}`;
+    if (action === 'camera_wiggle') return `camera_wiggle: cycles=${JSON.stringify(args.cycles)} amplitude=${JSON.stringify(args.amplitude)} speed_s=${JSON.stringify(args.speed_s)}`;
+    if (action === 'llm_service') return `llm_service: ${JSON.stringify(args.op || '')}`;
+    if (action === 'catalog_only') return `catalog_command: ${JSON.stringify(args.command || '')}`;
+    return `${action}${Object.keys(args || {}).length ? `: ${JSON.stringify(args)}` : ''}`;
+  }
+
   function formatParseResult(payload) {
     if (!payload || typeof payload !== 'object') return String(payload || '');
     const intent = payload.intent || {};
@@ -174,7 +190,12 @@
       payload.steps.forEach((step, index) => {
         const stepIntent = step.intent || {};
         lines.push(`${index + 1}. ${stepIntent.summary || stepIntent.action || 'unknown'}`);
+        lines.push(`   -> ${describeIntent(stepIntent)}`);
       });
+    } else if (intent && intent.action) {
+      lines.push('');
+      lines.push('Command to send:');
+      lines.push(`- ${describeIntent(intent)}`);
     }
     if (payload.hint) {
       lines.push('');
@@ -205,6 +226,7 @@
         const intent = item.intent || {};
         const result = item.result || {};
         lines.push(`${item.index}. ${intent.summary || intent.action || 'unknown'} -> ${result.ok ? 'ok' : 'failed'}`);
+        lines.push(`   command: ${describeIntent(intent)}`);
         (result.results || []).forEach((sub) => {
           lines.push(`   - ${sub.robot_id || 'robot'}: ${sub.ok ? 'ok' : 'failed'}`);
           if (sub.preview_only) {
@@ -223,6 +245,7 @@
     lines.push('Results:');
     (payload.results || []).forEach((item) => {
       lines.push(`- ${item.robot_id || 'robot'}: ${item.ok ? 'ok' : 'failed'}`);
+      if (parsed.intent) lines.push(`  command: ${describeIntent(parsed.intent)}`);
       if (item.preview_only) {
         lines.push(`  preview: ${item.method || 'POST'} ${item.url || ''}`);
         if (item.would_send) lines.push(`  payload: ${JSON.stringify(item.would_send)}`);
