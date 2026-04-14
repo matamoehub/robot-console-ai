@@ -113,10 +113,30 @@
   const btnTelegramTest = document.getElementById('btnTelegramTest');
   const btnTelegramLive = document.getElementById('btnTelegramLive');
   let lastParsed = null;
+  let robotCatalog = {};
+  let robotIndex = {};
 
   function show(el, value) {
     if (!el) return;
     el.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  }
+
+  function familyCommandsForRobot(robotId) {
+    const robot = robotIndex[robotId] || {};
+    const family = robotCatalog[String(robot.robot_type || '').trim()] || {};
+    const caps = Array.isArray(family.capabilities) ? family.capabilities : [];
+    const lines = [];
+    caps.forEach((group) => {
+      const ns = String(group.namespace || '').trim();
+      const commands = Array.isArray(group.commands) ? group.commands : [];
+      if (!ns || !commands.length) return;
+      lines.push(`- ${ns}: ${commands.join(', ')}`);
+    });
+    return {
+      robotLabel: robot.catalog_label || robot.type || robotId || 'Robot',
+      familyLabel: family.label || robot.catalog_label || robot.type || '',
+      commandsText: lines.join('\n'),
+    };
   }
 
   function formatParseResult(payload) {
@@ -142,6 +162,12 @@
     if (payload.source) {
       lines.push(`Parser source: ${payload.source}`);
     }
+    const familyInfo = familyCommandsForRobot(payload.target_robot_id || '');
+    if (familyInfo.commandsText) {
+      lines.push('');
+      lines.push(`Available commands for ${familyInfo.robotLabel}:`);
+      lines.push(familyInfo.commandsText);
+    }
     if (Array.isArray(payload.steps) && payload.steps.length > 1) {
       lines.push('');
       lines.push('Planned steps:');
@@ -165,6 +191,13 @@
     lines.push(`Command: ${intent.summary || intent.action || 'unknown'}`);
     lines.push(`Targets: ${payload.target_count || 0}`);
     lines.push(`Overall status: ${payload.ok ? 'ok' : 'error'}`);
+    const parsed = payload.parsed || {};
+    const familyInfo = familyCommandsForRobot(parsed.target_robot_id || '');
+    if (familyInfo.commandsText) {
+      lines.push('');
+      lines.push(`Available commands for ${familyInfo.robotLabel}:`);
+      lines.push(familyInfo.commandsText);
+    }
     if (payload.multi_step && Array.isArray(payload.step_results)) {
       lines.push('');
       lines.push('Step results:');
@@ -285,6 +318,10 @@
       show(robotControlOut, j);
       return;
     }
+    robotIndex = {};
+    (j.robots || []).forEach((robot) => {
+      robotIndex[String(robot.id || '')] = robot;
+    });
     setRobotOptions(directRobot, j.robots || []);
     setRobotOptions(telegramRobot, j.robots || []);
     const summary = (j.robots || []).map((robot) => {
@@ -292,6 +329,15 @@
       return `${robot.id} (${robot.catalog_label || robot.type || 'Robot'}) mode=${mode}`;
     });
     show(robotControlOut, summary.length ? `Loaded robots:\n${summary.join('\n')}` : 'No robots found.');
+  }
+
+  async function refreshCatalog() {
+    const r = await fetch('/api/admin/robot-control/catalog', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) {
+      robotCatalog = j.families || {};
+    }
+    return j;
   }
 
   async function directParse() {
@@ -372,6 +418,7 @@
   });
 
   await refreshMode();
+  await refreshCatalog();
   await refreshRobots();
 })();
 </script>
