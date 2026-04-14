@@ -153,18 +153,27 @@ def need_login(fn):
 
 
 def _systemctl_run(args: List[str], timeout: float = 20.0) -> Dict[str, Any]:
-    cmd = ["systemctl", *args]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-        return {
-            "ok": p.returncode == 0,
-            "cmd": " ".join(shlex.quote(x) for x in cmd),
-            "returncode": p.returncode,
-            "stdout": (p.stdout or "").strip(),
-            "stderr": (p.stderr or "").strip(),
-        }
-    except Exception as exc:
-        return {"ok": False, "cmd": " ".join(shlex.quote(x) for x in cmd), "error": str(exc)}
+    attempts = [
+        ["systemctl", *args],
+        ["sudo", "-n", "systemctl", *args],
+    ]
+    last: Dict[str, Any] | None = None
+    for cmd in attempts:
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+            result = {
+                "ok": p.returncode == 0,
+                "cmd": " ".join(shlex.quote(x) for x in cmd),
+                "returncode": p.returncode,
+                "stdout": (p.stdout or "").strip(),
+                "stderr": (p.stderr or "").strip(),
+            }
+            if result["ok"]:
+                return result
+            last = result
+        except Exception as exc:
+            last = {"ok": False, "cmd": " ".join(shlex.quote(x) for x in cmd), "error": str(exc)}
+    return last or {"ok": False, "cmd": "systemctl", "error": "systemctl_failed"}
 
 
 def _tail_text(path: Path, max_lines: int = 120) -> str:
@@ -439,6 +448,38 @@ def _switch_hailo_mode(target: str) -> Dict[str, Any]:
         return {"ok": True, "target": target, "steps": steps}
 
 
+def _hailo_mode_status() -> Dict[str, Any]:
+    llm_health = _service_health(f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list")
+    vlm_health = _service_health(f"{VLM_API_BASE_URL.rstrip('/')}/healthz")
+    llm_status = _service_status({
+        "key": "hailo-ollama",
+        "label": "Hailo Ollama",
+        "service_name": HAILO_OLLAMA_SERVICE_NAME,
+        "description": "",
+        "health_url": f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list",
+    })
+    vlm_status = _service_status({
+        "key": "vlm-service",
+        "label": "VLM Service",
+        "service_name": VLM_SERVICE_UNIT_NAME,
+        "description": "",
+        "health_url": f"{VLM_API_BASE_URL.rstrip('/')}/healthz",
+    })
+    active_mode = "unknown"
+    if llm_health.get("ok") and not vlm_health.get("ok"):
+        active_mode = "llm"
+    elif vlm_health.get("ok") and not llm_health.get("ok"):
+        active_mode = "vlm"
+    elif llm_health.get("ok") and vlm_health.get("ok"):
+        active_mode = "shared"
+    return {
+        "ok": True,
+        "active_mode": active_mode,
+        "llm": llm_status,
+        "vlm": vlm_status,
+    }
+
+
 def _service_logs(item: Dict[str, Any], lines: int = 120) -> Dict[str, Any]:
     lines = max(10, min(int(lines), 500))
     cmd = ["journalctl", "-u", item.get("journal_unit") or item["service_name"], "-n", str(lines), "--no-pager"]
@@ -549,9 +590,25 @@ def api_admin_config():
             "pass_hash_file": str(PASS_HASH_FILE),
             "hailo_ollama_api_base_url": HAILO_OLLAMA_API_BASE_URL,
             "vlm_api_base_url": VLM_API_BASE_URL,
+            "hailo_mode": _hailo_mode_status(),
             "services": AI_SERVICES,
         }
     )
+
+
+@APP.get("/api/admin/hailo/mode")
+@need_login
+def api_admin_hailo_mode():
+    return jsonify(_hailo_mode_status())
+
+
+@APP.post("/api/admin/hailo/mode/<target>")
+@need_login
+def api_admin_hailo_mode_switch(target: str):
+    result = _switch_hailo_mode(target)
+    if result.get("ok"):
+        result["status"] = _hailo_mode_status()
+    return jsonify(result), (200 if result.get("ok") else 503)
 
 
 @APP.get("/api/admin/llm/models")
@@ -574,11 +631,11 @@ def api_admin_llm_chat():
     if not model:
         return jsonify({"ok": False, "error": "missing_model"}), 400
     with HAILO_DEVICE_LOCK:
-        switch = _switch_hailo_mode("llm")
-        if not switch.get("ok"):
-            return jsonify({"ok": False, "error": "hailo_mode_switch_failed", "switch": switch}), 503
+        mode = _hailo_mode_status()
+        if mode.get("active_mode") not in {"llm", "shared"}:
+            return jsonify({"ok": False, "error": "hailo_mode_not_llm", "mode": mode}), 503
         result = _hailo_ollama_chat(model, prompt)
-        result["switch"] = switch
+        result["mode"] = mode
     return jsonify(result), (200 if result.get("ok") else 503)
 
 
@@ -599,9 +656,9 @@ def api_admin_vlm_caption():
     if not image_data_url:
         return jsonify({"ok": False, "error": "missing_image_data_url"}), 400
     with HAILO_DEVICE_LOCK:
-        switch = _switch_hailo_mode("vlm")
-        if not switch.get("ok"):
-            return jsonify({"ok": False, "error": "hailo_mode_switch_failed", "switch": switch}), 503
+        mode = _hailo_mode_status()
+        if mode.get("active_mode") not in {"vlm", "shared"}:
+            return jsonify({"ok": False, "error": "hailo_mode_not_vlm", "mode": mode}), 503
         payload = {
             "model": model,
             "messages": [
@@ -615,7 +672,7 @@ def api_admin_vlm_caption():
             ],
         }
         result = _vlm_caption_request(payload)
-        result["switch"] = switch
+        result["mode"] = mode
     return jsonify(result), (200 if result.get("ok") else 503)
 
 

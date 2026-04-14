@@ -14,6 +14,8 @@
         <div class="fw-semibold mt-3 mb-2">Pages</div>
         <div><a href="/admin">/admin</a></div>
         <div><a href="/logs">/logs</a></div>
+        <div class="fw-semibold mt-3 mb-2">Hailo Mode</div>
+        <div id="hailoModeBadge" class="mono small">Loading...</div>
         <div class="mt-3">
           <button id="btnRunTests" class="btn btn-outline-success btn-sm" type="button">Run Tests</button>
           <button id="btnUpdateRestart" class="btn btn-danger btn-sm" type="button">Git Sync + Restart</button>
@@ -21,6 +23,10 @@
         <div class="mt-2">
           <button id="btnRefreshServices" class="btn btn-outline-primary btn-sm" type="button">Refresh Status</button>
           <button id="btnRefreshConfig" class="btn btn-outline-secondary btn-sm" type="button">View Config</button>
+        </div>
+        <div class="mt-2 d-flex gap-2 flex-wrap">
+          <button id="btnModeLlm" class="btn btn-outline-dark btn-sm" type="button">Switch To LLM</button>
+          <button id="btnModeVlm" class="btn btn-outline-dark btn-sm" type="button">Switch To VLM</button>
         </div>
         <pre id="adminOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap;">(no action yet)</pre>
       </div>
@@ -131,8 +137,11 @@
 <script>
 (async function () {
   const out = document.getElementById('adminOut');
+  const hailoModeBadge = document.getElementById('hailoModeBadge');
   const btnRunTests = document.getElementById('btnRunTests');
   const btnUpdateRestart = document.getElementById('btnUpdateRestart');
+  const btnModeLlm = document.getElementById('btnModeLlm');
+  const btnModeVlm = document.getElementById('btnModeVlm');
   const llmModel = document.getElementById('llmModel');
   const llmPrompt = document.getElementById('llmPrompt');
   const llmOut = document.getElementById('llmOut');
@@ -158,6 +167,12 @@
   function show(v) {
     if (!out) return;
     out.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  }
+
+  function renderHailoMode(status) {
+    if (!hailoModeBadge) return;
+    const mode = String((status && status.active_mode) || 'unknown');
+    hailoModeBadge.textContent = mode;
   }
 
   function showLlm(v) {
@@ -329,6 +344,17 @@
     (j.services || []).forEach(renderService);
   }
 
+  async function refreshHailoMode() {
+    const r = await fetch('/api/admin/hailo/mode', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      show(j || { error: `HTTP ${r.status}` });
+      return null;
+    }
+    renderHailoMode(j);
+    return j;
+  }
+
   function pollPostUpdate(baseOut) {
     if (updatePollTimer) clearInterval(updatePollTimer);
     const tick = async () => {
@@ -359,6 +385,7 @@
   document.getElementById('btnRefreshServices')?.addEventListener('click', async () => {
     show('Refreshing AI service status...');
     await refreshServices();
+    await refreshHailoMode();
     show('Service status refreshed.');
   });
 
@@ -457,7 +484,11 @@
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j.ok) {
-        showLlm(j);
+        if (j && j.error === 'hailo_mode_not_llm') {
+          showLlm('Switch Hailo mode to LLM first.');
+        } else {
+          showLlm(j);
+        }
         return;
       }
       const text = extractLlmText(j) || 'No assistant text returned.';
@@ -570,7 +601,11 @@
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j.ok) {
-        showVlm(`${formatVlmError(j)}${formatTiming(j)}`);
+        if (j && j.error === 'hailo_mode_not_vlm') {
+          showVlm('Switch Hailo mode to VLM first.');
+        } else {
+          showVlm(`${formatVlmError(j)}${formatTiming(j)}`);
+        }
         return;
       }
       const content = (((j.response || {}).choices || [])[0] || {}).message?.content;
@@ -581,7 +616,44 @@
     }
   });
 
+  async function switchHailoMode(target) {
+    show(`Switching Hailo mode to ${target}...`);
+    const r = await fetch(`/api/admin/hailo/mode/${encodeURIComponent(target)}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      show(j);
+      return;
+    }
+    renderHailoMode(j.status || j);
+    await refreshServices();
+    show(j);
+  }
+
+  btnModeLlm?.addEventListener('click', async () => {
+    btnModeLlm.disabled = true;
+    try {
+      await switchHailoMode('llm');
+    } finally {
+      btnModeLlm.disabled = false;
+    }
+  });
+
+  btnModeVlm?.addEventListener('click', async () => {
+    btnModeVlm.disabled = true;
+    try {
+      await switchHailoMode('vlm');
+    } finally {
+      btnModeVlm.disabled = false;
+    }
+  });
+
   await refreshServices();
+  await refreshHailoMode();
   window.addEventListener('beforeunload', stopCamera);
 })();
 </script>
