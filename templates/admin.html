@@ -214,6 +214,20 @@
     if (typeof data.message === 'object' && data.message && typeof data.message.content === 'string') return data.message.content;
     if (typeof data.response === 'string') return data.response;
     if (typeof data.content === 'string') return data.content;
+    if (typeof data.raw === 'string') {
+      const lines = data.raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const parts = [];
+      for (const line of lines) {
+        try {
+          const chunk = JSON.parse(line);
+          const content = chunk && chunk.message && typeof chunk.message.content === 'string' ? chunk.message.content : '';
+          if (content) parts.push(content);
+        } catch (_err) {
+          // Keep going; raw is only for fallback/error display.
+        }
+      }
+      if (parts.length) return parts.join('');
+    }
     return '';
   }
 
@@ -425,7 +439,7 @@
         showLlm(j);
         return;
       }
-      const text = extractLlmText(j) || JSON.stringify(j, null, 2);
+      const text = extractLlmText(j) || 'No assistant text returned.';
       showLlm(`${text}${formatTiming(j)}`);
     } finally {
       btnLlmAsk.disabled = false;
@@ -539,7 +553,7 @@
         return;
       }
       const content = (((j.response || {}).choices || [])[0] || {}).message?.content;
-      const text = content || JSON.stringify(j, null, 2);
+      const text = content || 'No assistant text returned.';
       showVlm(`${text}${formatTiming(j)}`);
     } finally {
       btnVlmAsk.disabled = false;
