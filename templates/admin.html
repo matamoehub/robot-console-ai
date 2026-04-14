@@ -54,6 +54,73 @@
       </div>
     </div>
   </div>
+  <div class="col-12 col-xl-8">
+    <div class="card h-100">
+      <div class="card-body">
+        <div class="fw-semibold mb-3">LLM Test</div>
+        <div class="row g-3">
+          <div class="col-12 col-lg-4">
+            <label class="form-label" for="llmModel">Model</label>
+            <input id="llmModel" class="form-control" list="llmModelList" placeholder="qwen2:1.5b">
+            <datalist id="llmModelList"></datalist>
+          </div>
+          <div class="col-12 col-lg-8">
+            <label class="form-label" for="llmPrompt">Prompt</label>
+            <textarea id="llmPrompt" class="form-control" rows="4" placeholder="Ask the local LLM a question."></textarea>
+          </div>
+        </div>
+        <div class="mt-3 d-flex gap-2 flex-wrap">
+          <button id="btnLlmAsk" class="btn btn-primary btn-sm" type="button">Ask LLM</button>
+          <button id="btnLlmModels" class="btn btn-outline-secondary btn-sm" type="button">Refresh Models</button>
+        </div>
+        <pre id="llmOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap;">(no LLM request yet)</pre>
+      </div>
+    </div>
+  </div>
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <div class="fw-semibold mb-3">VLM Test</div>
+        <div class="row g-3">
+          <div class="col-12 col-lg-3">
+            <label class="form-label" for="vlmModel">Model</label>
+            <input id="vlmModel" class="form-control" list="vlmModelList" placeholder="local-vlm">
+            <datalist id="vlmModelList"></datalist>
+          </div>
+          <div class="col-12 col-lg-3">
+            <label class="form-label" for="vlmPrompt">Prompt</label>
+            <textarea id="vlmPrompt" class="form-control" rows="5" placeholder="Describe this image and tell me what matters."></textarea>
+          </div>
+          <div class="col-12 col-lg-3">
+            <label class="form-label" for="vlmImage">Image</label>
+            <input id="vlmImage" class="form-control" type="file" accept=".heic,.heif,.jpg,.jpeg,.png,image/heic,image/heif,image/jpeg,image/png" capture="environment">
+            <div class="form-text">Accepts HEIC, JPG, and PNG. You can also use the camera below.</div>
+          </div>
+          <div class="col-12 col-lg-3">
+            <div class="mb-2">Preview</div>
+            <img id="vlmPreview" alt="VLM preview" class="img-fluid rounded border d-none" style="max-height: 220px; object-fit: contain;">
+          </div>
+        </div>
+        <div class="row g-3 mt-1">
+          <div class="col-12 col-lg-6">
+            <div class="d-flex gap-2 flex-wrap mb-2">
+              <button id="btnOpenCamera" class="btn btn-outline-dark btn-sm" type="button">Open Camera</button>
+              <button id="btnCaptureCamera" class="btn btn-outline-primary btn-sm" type="button" disabled>Capture Frame</button>
+              <button id="btnCloseCamera" class="btn btn-outline-secondary btn-sm" type="button" disabled>Close Camera</button>
+            </div>
+            <video id="vlmCamera" class="w-100 rounded border d-none" autoplay playsinline muted style="max-height: 280px; object-fit: cover;"></video>
+            <canvas id="vlmCanvas" class="d-none"></canvas>
+          </div>
+        </div>
+        <div class="mt-3 d-flex gap-2 flex-wrap">
+          <button id="btnVlmAsk" class="btn btn-primary btn-sm" type="button">Ask VLM</button>
+          <button id="btnVlmModels" class="btn btn-outline-secondary btn-sm" type="button">Refresh Models</button>
+          <button id="btnVlmClear" class="btn btn-outline-secondary btn-sm" type="button">Clear</button>
+        </div>
+        <pre id="vlmOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap;">(no VLM request yet)</pre>
+      </div>
+    </div>
+  </div>
 </div>
 {% endblock %}
 {% block scripts %}
@@ -62,11 +129,125 @@
   const out = document.getElementById('adminOut');
   const btnRunTests = document.getElementById('btnRunTests');
   const btnUpdateRestart = document.getElementById('btnUpdateRestart');
+  const llmModel = document.getElementById('llmModel');
+  const llmModelList = document.getElementById('llmModelList');
+  const llmPrompt = document.getElementById('llmPrompt');
+  const llmOut = document.getElementById('llmOut');
+  const btnLlmAsk = document.getElementById('btnLlmAsk');
+  const btnLlmModels = document.getElementById('btnLlmModels');
+  const vlmModel = document.getElementById('vlmModel');
+  const vlmModelList = document.getElementById('vlmModelList');
+  const vlmPrompt = document.getElementById('vlmPrompt');
+  const vlmImage = document.getElementById('vlmImage');
+  const vlmPreview = document.getElementById('vlmPreview');
+  const vlmCamera = document.getElementById('vlmCamera');
+  const vlmCanvas = document.getElementById('vlmCanvas');
+  const vlmOut = document.getElementById('vlmOut');
+  const btnVlmAsk = document.getElementById('btnVlmAsk');
+  const btnVlmModels = document.getElementById('btnVlmModels');
+  const btnVlmClear = document.getElementById('btnVlmClear');
+  const btnOpenCamera = document.getElementById('btnOpenCamera');
+  const btnCaptureCamera = document.getElementById('btnCaptureCamera');
+  const btnCloseCamera = document.getElementById('btnCloseCamera');
   let updatePollTimer = null;
+  let currentImageDataUrl = '';
+  let cameraStream = null;
 
   function show(v) {
     if (!out) return;
     out.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  }
+
+  function showLlm(v) {
+    if (!llmOut) return;
+    llmOut.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  }
+
+  function showVlm(v) {
+    if (!vlmOut) return;
+    vlmOut.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  }
+
+  function setModelOptions(datalist, models) {
+    if (!datalist) return;
+    datalist.innerHTML = '';
+    (models || []).forEach((model) => {
+      const opt = document.createElement('option');
+      opt.value = model;
+      datalist.appendChild(opt);
+    });
+  }
+
+  function fileToDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('file_read_failed'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function extractLlmModels(payload) {
+    const data = (payload && payload.response) || payload || {};
+    if (Array.isArray(data)) return data.map(String).filter(Boolean);
+    if (Array.isArray(data.models)) return data.models.map((item) => String(item && (item.name || item.model || item)).trim()).filter(Boolean);
+    if (Array.isArray(data.data)) return data.data.map((item) => String(item && (item.id || item.name || item)).trim()).filter(Boolean);
+    return [];
+  }
+
+  function extractLlmText(payload) {
+    const data = (payload && payload.response) || payload || {};
+    if (typeof data.message === 'object' && data.message && typeof data.message.content === 'string') return data.message.content;
+    if (typeof data.response === 'string') return data.response;
+    if (typeof data.content === 'string') return data.content;
+    return '';
+  }
+
+  function extractVlmModels(payload) {
+    const data = (payload && payload.response) || payload || {};
+    if (Array.isArray(data.data)) return data.data.map((item) => String(item && (item.id || item.name || item)).trim()).filter(Boolean);
+    return [];
+  }
+
+  function stopCamera() {
+    if (cameraStream) {
+      cameraStream.getTracks().forEach((track) => track.stop());
+      cameraStream = null;
+    }
+    if (vlmCamera) {
+      vlmCamera.classList.add('d-none');
+      vlmCamera.srcObject = null;
+    }
+    if (btnCaptureCamera) btnCaptureCamera.disabled = true;
+    if (btnCloseCamera) btnCloseCamera.disabled = true;
+  }
+
+  async function refreshLlmModels() {
+    showLlm('Loading models...');
+    const r = await fetch('/api/admin/llm/models', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      showLlm(j);
+      return;
+    }
+    const models = extractLlmModels(j);
+    setModelOptions(llmModelList, models);
+    if (llmModel && !llmModel.value && models[0]) llmModel.value = models[0];
+    showLlm(models.length ? `Loaded models: ${models.join(', ')}` : j);
+  }
+
+  async function refreshVlmModels() {
+    showVlm('Loading VLM models...');
+    const r = await fetch('/api/admin/vlm/models', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      showVlm(j);
+      return;
+    }
+    const models = extractVlmModels(j);
+    setModelOptions(vlmModelList, models);
+    if (vlmModel && !vlmModel.value && models[0]) vlmModel.value = models[0];
+    showVlm(models.length ? `Loaded models: ${models.join(', ')}` : j);
   }
 
   function renderService(svc) {
@@ -203,7 +384,156 @@
     });
   });
 
+  btnLlmModels?.addEventListener('click', refreshLlmModels);
+
+  btnLlmAsk?.addEventListener('click', async () => {
+    const prompt = (llmPrompt?.value || '').trim();
+    const model = (llmModel?.value || '').trim();
+    if (!prompt) {
+      showLlm('Enter a prompt first.');
+      return;
+    }
+    if (!model) {
+      showLlm('Choose or enter a model first.');
+      return;
+    }
+    btnLlmAsk.disabled = true;
+    showLlm('Sending prompt to LLM...');
+    try {
+      const r = await fetch('/api/admin/llm/chat', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, prompt })
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        showLlm(j);
+        return;
+      }
+      showLlm(extractLlmText(j) || j);
+    } finally {
+      btnLlmAsk.disabled = false;
+    }
+  });
+
+  vlmImage?.addEventListener('change', async () => {
+    const file = vlmImage.files && vlmImage.files[0];
+    if (!file) {
+      currentImageDataUrl = '';
+      vlmPreview?.classList.add('d-none');
+      if (vlmPreview) vlmPreview.removeAttribute('src');
+      return;
+    }
+    showVlm(`Loading ${file.name}...`);
+    try {
+      currentImageDataUrl = await fileToDataUrl(file);
+      if (vlmPreview) {
+        vlmPreview.src = currentImageDataUrl;
+        vlmPreview.classList.remove('d-none');
+      }
+      showVlm(`Ready: ${file.name}`);
+    } catch (err) {
+      currentImageDataUrl = '';
+      showVlm(`Image load failed: ${String(err)}`);
+    }
+  });
+
+  btnOpenCamera?.addEventListener('click', async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      showVlm('Camera access is not available in this browser.');
+      return;
+    }
+    try {
+      stopCamera();
+      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      if (vlmCamera) {
+        vlmCamera.srcObject = cameraStream;
+        vlmCamera.classList.remove('d-none');
+      }
+      if (btnCaptureCamera) btnCaptureCamera.disabled = false;
+      if (btnCloseCamera) btnCloseCamera.disabled = false;
+      showVlm('Camera ready. Capture a frame when you like.');
+    } catch (err) {
+      showVlm(`Camera open failed: ${String(err)}`);
+    }
+  });
+
+  btnCaptureCamera?.addEventListener('click', async () => {
+    if (!vlmCamera || !vlmCanvas || !cameraStream) {
+      showVlm('Open the camera first.');
+      return;
+    }
+    const width = vlmCamera.videoWidth || 1280;
+    const height = vlmCamera.videoHeight || 720;
+    vlmCanvas.width = width;
+    vlmCanvas.height = height;
+    const ctx = vlmCanvas.getContext('2d');
+    if (!ctx) {
+      showVlm('Could not access the capture canvas.');
+      return;
+    }
+    ctx.drawImage(vlmCamera, 0, 0, width, height);
+    currentImageDataUrl = vlmCanvas.toDataURL('image/jpeg', 0.92);
+    if (vlmPreview) {
+      vlmPreview.src = currentImageDataUrl;
+      vlmPreview.classList.remove('d-none');
+    }
+    showVlm('Captured a frame from the camera.');
+  });
+
+  btnCloseCamera?.addEventListener('click', () => {
+    stopCamera();
+    showVlm('Camera closed.');
+  });
+
+  btnVlmModels?.addEventListener('click', refreshVlmModels);
+
+  btnVlmClear?.addEventListener('click', () => {
+    currentImageDataUrl = '';
+    if (vlmImage) vlmImage.value = '';
+    if (vlmPrompt) vlmPrompt.value = '';
+    if (vlmModel) vlmModel.value = '';
+    if (vlmPreview) {
+      vlmPreview.classList.add('d-none');
+      vlmPreview.removeAttribute('src');
+    }
+    stopCamera();
+    showVlm('(no VLM request yet)');
+  });
+
+  btnVlmAsk?.addEventListener('click', async () => {
+    if (!currentImageDataUrl) {
+      showVlm('Choose an image first.');
+      return;
+    }
+    const prompt = (vlmPrompt?.value || '').trim() || 'Describe this image and answer briefly.';
+    const model = (vlmModel?.value || '').trim() || 'local-vlm';
+    btnVlmAsk.disabled = true;
+    showVlm('Sending image to VLM...');
+    try {
+      const r = await fetch('/api/admin/vlm/caption', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, model, image_data_url: currentImageDataUrl })
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        showVlm(j);
+        return;
+      }
+      const content = (((j.response || {}).choices || [])[0] || {}).message?.content;
+      showVlm(content || j);
+    } finally {
+      btnVlmAsk.disabled = false;
+    }
+  });
+
+  await refreshLlmModels();
+  await refreshVlmModels();
   await refreshServices();
+  window.addEventListener('beforeunload', stopCamera);
 })();
 </script>
 {% endblock %}

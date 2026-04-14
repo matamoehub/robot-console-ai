@@ -31,6 +31,7 @@ deactivate
 echo "[5/8] Installing systemd units"
 sudo cp deploy/systemd/robot-console-ai.service /etc/systemd/system/
 sudo cp deploy/systemd/hailo-ollama.service /etc/systemd/system/
+sudo cp deploy/systemd/vlm-service.service /etc/systemd/system/
 
 echo "[6/8] Optional AI HAT+ 2 packages"
 echo "Run these separately when ready:"
@@ -65,5 +66,7 @@ sudo systemctl daemon-reload
 echo "Next:"
 echo "  sudo systemctl enable robot-console-ai"
 echo "  sudo systemctl enable hailo-ollama"
+echo "  sudo systemctl enable vlm-service"
 echo "  sudo systemctl restart robot-console-ai"
 echo "  sudo systemctl restart hailo-ollama"
+echo "  sudo systemctl restart vlm-service"

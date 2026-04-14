@@ -37,6 +37,7 @@ The Admin page exposes status and start/stop/restart actions for:
 The default health checks are:
 
 - `http://127.0.0.1:8000/hailo/v1/list`
+- `http://127.0.0.1:8090/healthz`
 - `http://127.0.0.1:3000`
 
 You can override the services with `AI_LOCAL_SERVICES_JSON` or simpler env vars:
@@ -46,6 +47,7 @@ HAILO_OLLAMA_SERVICE=hailo-ollama
 HAILO_OLLAMA_HEALTH_URL=http://127.0.0.1:8000/hailo/v1/list
 OPEN_WEBUI_SERVICE=open-webui
 OPEN_WEBUI_HEALTH_URL=http://127.0.0.1:3000
+VLM_HEALTH_URL=http://127.0.0.1:8090/healthz
 ```
 
 ## Raspberry Pi AI HAT+ 2 notes
@@ -88,6 +90,7 @@ It will:
 - create `.venv`
 - install Python requirements
 - install systemd units from `deploy/systemd`
+- install `vlm-service.service`
 
 ## Manual setup summary
 
@@ -131,9 +134,11 @@ cp .env.example .env
 ```bash
 sudo cp deploy/systemd/robot-console-ai.service /etc/systemd/system/
 sudo cp deploy/systemd/hailo-ollama.service /etc/systemd/system/
+sudo cp deploy/systemd/vlm-service.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable robot-console-ai
 sudo systemctl enable hailo-ollama
+sudo systemctl enable vlm-service
 ```
 
 ### 6. Update/restart helper scripts
@@ -149,6 +154,7 @@ Those are what the Admin page uses for self-update and restart.
 
 - `deploy/systemd/robot-console-ai.service`
 - `deploy/systemd/hailo-ollama.service`
+- `deploy/systemd/vlm-service.service`
 - `deploy/systemd/open-webui.service`
 
 ## Repo layout
@@ -158,6 +164,7 @@ Those are what the Admin page uses for self-update and restart.
 - `static/` - frontend JS and assets
 - `deploy/systemd/` - systemd units for this Pi
 - `scripts/setup_pi_ai.sh` - Pi bootstrap helper
+- `app_vlm.py` - local VLM service shim
 - `.env.example` - starting env file for a new host
 
 ## Current defaults
@@ -169,6 +176,59 @@ Those are what the Admin page uses for self-update and restart.
   - `hailo-ollama`
   - `vlm-service`
   - `open-webui`
+
+## VLM service
+
+This repo now includes a small local VLM HTTP service in `app_vlm.py`.
+
+- health endpoint: `GET /healthz`
+- model list endpoint: `GET /v1/models`
+- caption endpoint: `POST /v1/caption`
+- OpenAI-style chat endpoint: `POST /v1/chat/completions`
+
+The intended backend for this service is the Hailo GenAI stack on AI HAT+ 2.
+
+Raspberry Pi's current AI documentation says VLMs on AI HAT+ 2 should be run through Hailo's `hailo-apps` repository, while LLMs use the Hailo Ollama server. Source:
+
+- [Raspberry Pi AI software docs](https://www.raspberrypi.com/documentation/computers/ai.html)
+- [hailo-ai/hailo-apps](https://github.com/hailo-ai/hailo-apps)
+
+The HTTP service here is a thin wrapper. Configure `VLM_BACKEND_CMD` in `.env` to point at an executable that:
+
+- reads a JSON payload from stdin
+- returns JSON like `{"text":"..."}` or plain text on stdout
+
+For a Hailo-backed setup, point it at the included wrapper:
+
+```bash
+VLM_BACKEND_CMD=/opt/robot/robot-console-ai/.venv/bin/python scripts/hailo_vlm_backend.py
+```
+
+Then set `HAILO_VLM_COMMAND_TEMPLATE` to the exact Hailo app command for your installed `hailo-apps` version. The wrapper will substitute:
+
+- `{prompt}`
+- `{image_path}`
+- `{model}`
+- `{max_tokens}`
+
+You can also set `HAILO_VLM_APP_DIR` if the command needs to run from inside your `hailo-apps` checkout.
+
+Example payload fields passed to the backend:
+
+- `prompt`
+- `image_path`
+- `image_base64`
+- `image_mime_type`
+- `model`
+- `max_tokens`
+
+Start it on the Pi with:
+
+```bash
+sudo systemctl enable vlm-service
+sudo systemctl restart vlm-service
+curl --silent http://127.0.0.1:8090/healthz
+```
 
 ## Status
 

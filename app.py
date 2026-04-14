@@ -59,6 +59,8 @@ APP_RESTART_SCRIPT = Path(os.environ.get("ROBOT_CONSOLE_AI_RESTART_SCRIPT", "/op
 UPDATE_TEST_LOG_PATH = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_TEST_LOG_PATH", "/tmp/robot-console-ai-update-tests.log")).expanduser()
 UPDATE_TEST_RC_PATH = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_TEST_RC_PATH", "/tmp/robot-console-ai-update-tests.rc")).expanduser()
 PASS_HASH_FILE = Path(os.environ.get("PASS_HASH_FILE", "/opt/robot/etc/robot-console-ai.passhash")).expanduser()
+HAILO_OLLAMA_API_BASE_URL = os.environ.get("HAILO_OLLAMA_API_BASE_URL", "http://127.0.0.1:8000").strip() or "http://127.0.0.1:8000"
+VLM_API_BASE_URL = os.environ.get("VLM_API_BASE_URL", "http://127.0.0.1:8090").strip() or "http://127.0.0.1:8090"
 PASS_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_USER = os.environ.get("RCAI_USER", "admin").strip() or "admin"
 if not PASS_HASH_FILE.exists():
@@ -80,7 +82,7 @@ DEFAULT_AI_SERVICES = [
         "key": "vlm-service",
         "label": "VLM Service",
         "service_name": os.environ.get("VLM_SERVICE_NAME", "vlm-service").strip() or "vlm-service",
-        "health_url": os.environ.get("VLM_HEALTH_URL", "").strip(),
+        "health_url": os.environ.get("VLM_HEALTH_URL", "http://127.0.0.1:8090/healthz").strip(),
         "description": "Optional local vision-language service running on this Pi.",
         "journal_unit": os.environ.get("VLM_SERVICE_NAME", "vlm-service").strip() or "vlm-service",
         "control_script": os.environ.get("VLM_CONTROL_SCRIPT", "").strip(),
@@ -288,6 +290,46 @@ def _service_health(url: str) -> Dict[str, Any]:
         return {"configured": True, "ok": False, "url": target, "error": str(exc)}
 
 
+def _http_json_request(method: str, url: str, *, payload: Dict[str, Any] | None = None, timeout: float = 120.0) -> Dict[str, Any]:
+    try:
+        import requests
+
+        kwargs: Dict[str, Any] = {"timeout": timeout}
+        if payload is not None:
+            kwargs["json"] = payload
+        r = requests.request(method.upper(), url, **kwargs)
+        content_type = (r.headers.get("content-type") or "").lower()
+        data = r.json() if "application/json" in content_type else {"raw": r.text}
+        return {
+            "ok": r.ok,
+            "status_code": r.status_code,
+            "url": url,
+            "response": data,
+        }
+    except Exception as exc:
+        return {"ok": False, "url": url, "error": str(exc)}
+
+
+def _hailo_ollama_models() -> Dict[str, Any]:
+    return _http_json_request("GET", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list", timeout=20.0)
+
+
+def _hailo_ollama_chat(model: str, prompt: str) -> Dict[str, Any]:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    return _http_json_request("POST", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/api/chat", payload=payload, timeout=120.0)
+
+
+def _vlm_caption_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _http_json_request("POST", f"{VLM_API_BASE_URL.rstrip('/')}/v1/chat/completions", payload=payload, timeout=120.0)
+
+
+def _vlm_models() -> Dict[str, Any]:
+    return _http_json_request("GET", f"{VLM_API_BASE_URL.rstrip('/')}/v1/models", timeout=20.0)
+
+
 def _service_status(item: Dict[str, Any]) -> Dict[str, Any]:
     service_name = item["service_name"]
     show = _systemctl_run([
@@ -454,9 +496,64 @@ def api_admin_config():
             "repo_dir": str(APP_REPO_DIR),
             "port": APP_PORT,
             "pass_hash_file": str(PASS_HASH_FILE),
+            "hailo_ollama_api_base_url": HAILO_OLLAMA_API_BASE_URL,
+            "vlm_api_base_url": VLM_API_BASE_URL,
             "services": AI_SERVICES,
         }
     )
+
+
+@APP.get("/api/admin/llm/models")
+@need_login
+def api_admin_llm_models():
+    result = _hailo_ollama_models()
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/admin/llm/chat")
+@need_login
+def api_admin_llm_chat():
+    body = request.get_json(silent=True) or {}
+    prompt = str(body.get("prompt") or "").strip()
+    model = str(body.get("model") or "").strip()
+    if not prompt:
+        return jsonify({"ok": False, "error": "missing_prompt"}), 400
+    if not model:
+        return jsonify({"ok": False, "error": "missing_model"}), 400
+    result = _hailo_ollama_chat(model, prompt)
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.get("/api/admin/vlm/models")
+@need_login
+def api_admin_vlm_models():
+    result = _vlm_models()
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/admin/vlm/caption")
+@need_login
+def api_admin_vlm_caption():
+    body = request.get_json(silent=True) or {}
+    prompt = str(body.get("prompt") or "").strip()
+    image_data_url = str(body.get("image_data_url") or "").strip()
+    model = str(body.get("model") or os.environ.get("VLM_MODEL_ID", "local-vlm")).strip() or "local-vlm"
+    if not image_data_url:
+        return jsonify({"ok": False, "error": "missing_image_data_url"}), 400
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt or DEFAULT_AI_SERVICES[1]["description"]},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            }
+        ],
+    }
+    result = _vlm_caption_request(payload)
+    return jsonify(result), (200 if result.get("ok") else 503)
 
 
 @APP.post("/api/admin/update-restart")
