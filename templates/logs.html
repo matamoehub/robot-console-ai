@@ -31,6 +31,49 @@
   const serviceSelect = document.getElementById('serviceSelect');
   const lineCount = document.getElementById('lineCount');
 
+  function formatLogs(payload) {
+    if (!payload || typeof payload !== 'object') {
+      return String(payload || '');
+    }
+
+    const service = payload.service || {};
+    const logs = payload.logs || {};
+    const parts = [];
+
+    const title = service.label || service.service_name || service.key || 'Logs';
+    parts.push(`${title}`);
+
+    if (service.service_name) parts.push(`service: ${service.service_name}`);
+    if (logs.cmd) parts.push(`command: ${logs.cmd}`);
+    if (typeof logs.returncode === 'number') parts.push(`return code: ${logs.returncode}`);
+    parts.push(`status: ${payload.ok ? 'ok' : 'error'}`);
+
+    if (logs.stdout) {
+      parts.push('');
+      parts.push('--- Journal ---');
+      parts.push(String(logs.stdout).trim());
+    }
+
+    if (logs.stderr) {
+      parts.push('');
+      parts.push('--- stderr ---');
+      parts.push(String(logs.stderr).trim());
+    }
+
+    if (logs.error) {
+      parts.push('');
+      parts.push('--- error ---');
+      parts.push(String(logs.error).trim());
+    }
+
+    if (!logs.stdout && !logs.stderr && !logs.error) {
+      parts.push('');
+      parts.push('No log output returned.');
+    }
+
+    return parts.join('\n');
+  }
+
   async function loadLogs() {
     const key = serviceSelect?.value || '';
     const lines = lineCount?.value || '120';
@@ -40,7 +83,7 @@
       cache: 'no-store'
     });
     const j = await r.json().catch(() => ({}));
-    out.textContent = JSON.stringify(j, null, 2);
+    out.textContent = formatLogs(j);
   }
 
   document.getElementById('btnLoadLogs')?.addEventListener('click', loadLogs);
