@@ -384,6 +384,66 @@ def parse_text_command(text: str, robots: List[Dict[str, Any]], preferred_robot_
     return result
 
 
+def _normalize_step_payload(payload: Dict[str, Any], target_scope: str, target_robot_id: str, mentioned_robot_ids: List[str], source_text: str) -> Dict[str, Any]:
+    step_intent = payload.get("intent") if isinstance(payload.get("intent"), dict) else {}
+    return {
+        "target_scope": target_scope,
+        "target_robot_id": target_robot_id,
+        "mentioned_robot_ids": list(mentioned_robot_ids),
+        "source": payload.get("source") or "rules",
+        "text": source_text,
+        "intent": {
+            "action": str(step_intent.get("action") or "unknown"),
+            "executable": bool(step_intent.get("executable")),
+            "arguments": step_intent.get("arguments") if isinstance(step_intent.get("arguments"), dict) else {},
+            "summary": str(step_intent.get("summary") or "").strip(),
+        },
+    }
+
+
+def parse_text_command_plan(text: str, robots: List[Dict[str, Any]], preferred_robot_id: str = "") -> Dict[str, Any]:
+    base = parse_text_command(text, robots, preferred_robot_id=preferred_robot_id)
+    if not base.get("ok"):
+        return base
+
+    raw_text = str(text or "").strip()
+    split_chunks = [chunk.strip() for chunk in re.split(r"\s+(?:and)\s+|,", raw_text) if chunk.strip()]
+    if len(split_chunks) <= 1:
+        base["steps"] = [
+            _normalize_step_payload(
+                base,
+                str(base.get("target_scope") or "single"),
+                str(base.get("target_robot_id") or ""),
+                list(base.get("mentioned_robot_ids") or []),
+                raw_text,
+            )
+        ]
+        return base
+
+    target_scope = str(base.get("target_scope") or "single")
+    target_robot_id = str(base.get("target_robot_id") or preferred_robot_id or "")
+    mentioned_robot_ids = list(base.get("mentioned_robot_ids") or [])
+    steps: List[Dict[str, Any]] = []
+    for chunk in split_chunks:
+        step = parse_text_command(chunk, robots, preferred_robot_id=target_robot_id)
+        steps.append(_normalize_step_payload(step, target_scope, target_robot_id, mentioned_robot_ids, chunk))
+
+    first_step = steps[0] if steps else {}
+    first_intent = first_step.get("intent") if isinstance(first_step.get("intent"), dict) else {}
+    base["intent"] = {
+        "action": str(first_intent.get("action") or base.get("intent", {}).get("action") or "unknown"),
+        "executable": all(bool((step.get("intent") or {}).get("executable")) for step in steps),
+        "arguments": first_intent.get("arguments") if isinstance(first_intent.get("arguments"), dict) else {},
+        "summary": " then ".join(
+            str((step.get("intent") or {}).get("summary") or (step.get("intent") or {}).get("action") or "unknown")
+            for step in steps
+        ),
+    }
+    base["steps"] = steps
+    base["multi_step"] = len(steps) > 1
+    return base
+
+
 def build_llm_parser_prompt(text: str, robots: List[Dict[str, Any]], preferred_robot_id: str = "") -> str:
     robot_lines = []
     for robot in robots:

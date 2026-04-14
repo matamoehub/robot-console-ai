@@ -1,6 +1,6 @@
 import unittest
 
-from robot_brain import parse_text_command
+from robot_brain import parse_text_command, parse_text_command_plan
 
 
 ROBOTS = [
@@ -31,6 +31,22 @@ class RobotBrainParseTests(unittest.TestCase):
         result = parse_text_command("Make Tony01 wave", ROBOTS)
         self.assertEqual(result["intent"]["action"], "catalog_only")
         self.assertFalse(result["intent"]["executable"])
+
+    def test_parse_multi_step_with_and(self):
+        result = parse_text_command_plan("Wave hello to the class and say hello", ROBOTS, preferred_robot_id="Tony01")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["multi_step"])
+        self.assertEqual(len(result["steps"]), 2)
+        self.assertEqual(result["steps"][0]["intent"]["action"], "catalog_only")
+        self.assertEqual(result["steps"][1]["intent"]["action"], "say")
+
+    def test_parse_multi_step_with_commas(self):
+        result = parse_text_command_plan("center camera, say hello", ROBOTS, preferred_robot_id="Mata01")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["multi_step"])
+        self.assertEqual(len(result["steps"]), 2)
+        self.assertEqual(result["steps"][0]["intent"]["action"], "camera_center")
+        self.assertEqual(result["steps"][1]["intent"]["action"], "say")
 
 
 if __name__ == "__main__":

@@ -142,6 +142,14 @@
     if (payload.source) {
       lines.push(`Parser source: ${payload.source}`);
     }
+    if (Array.isArray(payload.steps) && payload.steps.length > 1) {
+      lines.push('');
+      lines.push('Planned steps:');
+      payload.steps.forEach((step, index) => {
+        const stepIntent = step.intent || {};
+        lines.push(`${index + 1}. ${stepIntent.summary || stepIntent.action || 'unknown'}`);
+      });
+    }
     if (payload.hint) {
       lines.push('');
       lines.push(`Hint: ${payload.hint}`);
@@ -157,6 +165,27 @@
     lines.push(`Command: ${intent.summary || intent.action || 'unknown'}`);
     lines.push(`Targets: ${payload.target_count || 0}`);
     lines.push(`Overall status: ${payload.ok ? 'ok' : 'error'}`);
+    if (payload.multi_step && Array.isArray(payload.step_results)) {
+      lines.push('');
+      lines.push('Step results:');
+      payload.step_results.forEach((item) => {
+        const intent = item.intent || {};
+        const result = item.result || {};
+        lines.push(`${item.index}. ${intent.summary || intent.action || 'unknown'} -> ${result.ok ? 'ok' : 'failed'}`);
+        (result.results || []).forEach((sub) => {
+          lines.push(`   - ${sub.robot_id || 'robot'}: ${sub.ok ? 'ok' : 'failed'}`);
+          if (sub.preview_only) {
+            lines.push(`     preview: ${sub.method || 'POST'} ${sub.url || ''}`);
+            if (sub.would_send) lines.push(`     payload: ${JSON.stringify(sub.would_send)}`);
+          } else {
+            if (sub.url) lines.push(`     url: ${sub.url}`);
+            if (typeof sub.status_code === 'number') lines.push(`     status: ${sub.status_code}`);
+            if (sub.error) lines.push(`     error: ${sub.error}`);
+          }
+        });
+      });
+      return lines.join('\n');
+    }
     lines.push('');
     lines.push('Results:');
     (payload.results || []).forEach((item) => {

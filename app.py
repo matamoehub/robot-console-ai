@@ -20,6 +20,7 @@ from robot_brain import (
     load_robot_registry,
     normalize_llm_intent,
     parse_text_command,
+    parse_text_command_plan,
     robot_catalog_payload,
 )
 
@@ -433,7 +434,7 @@ def _parse_robot_text_with_llm(text: str, robots: List[Dict[str, Any]], preferre
 
 def _parse_robot_text_request(text: str, preferred_robot_id: str = "", use_llm: bool = True) -> Dict[str, Any]:
     robots = _robot_registry()
-    rule_result = parse_text_command(text, robots, preferred_robot_id=preferred_robot_id)
+    rule_result = parse_text_command_plan(text, robots, preferred_robot_id=preferred_robot_id)
     if rule_result.get("intent", {}).get("action") != "unknown":
         rule_result["available_robots"] = robots
         return rule_result
@@ -451,6 +452,35 @@ def _parse_robot_text_request(text: str, preferred_robot_id: str = "", use_llm: 
 
 
 def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    steps = parsed.get("steps") if isinstance(parsed.get("steps"), list) and parsed.get("steps") else None
+    if steps:
+        step_results: List[Dict[str, Any]] = []
+        overall_ok = True
+        for index, step in enumerate(steps, start=1):
+            step_parsed = {
+                "target_scope": step.get("target_scope") or parsed.get("target_scope"),
+                "target_robot_id": step.get("target_robot_id") or parsed.get("target_robot_id"),
+                "intent": step.get("intent") or {},
+            }
+            single_result = _execute_robot_intent({**parsed, **step_parsed, "steps": []})
+            step_results.append(
+                {
+                    "index": index,
+                    "text": step.get("text") or "",
+                    "intent": step.get("intent") or {},
+                    "result": single_result,
+                }
+            )
+            overall_ok = overall_ok and bool(single_result.get("ok"))
+        return {
+            "ok": overall_ok,
+            "parsed": parsed,
+            "step_results": step_results,
+            "results": [item.get("result") for item in step_results],
+            "target_count": len(step_results),
+            "multi_step": True,
+        }
+
     intent = parsed.get("intent") if isinstance(parsed.get("intent"), dict) else {}
     action = str(intent.get("action") or "").strip()
     args = intent.get("arguments") if isinstance(intent.get("arguments"), dict) else {}
