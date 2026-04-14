@@ -201,10 +201,19 @@ The HTTP service here is a thin wrapper. Configure `VLM_BACKEND_CMD` in `.env` t
 For a Hailo-backed setup, point it at the included wrapper:
 
 ```bash
-VLM_BACKEND_CMD=/opt/robot/robot-console-ai/.venv/bin/python scripts/hailo_vlm_backend.py
+VLM_BACKEND_CMD=/home/matamoe/hailo-apps/venv_hailo_apps/bin/python /opt/robot/robot-console-ai/scripts/hailo_vlm_backend.py
 ```
 
-Then set `HAILO_VLM_COMMAND_TEMPLATE` to the exact Hailo app command for your installed `hailo-apps` version. The wrapper will substitute:
+By default the wrapper now uses `HAILO_VLM_BACKEND_MODE=direct`, which imports the Hailo Python VLM APIs directly from your `hailo-apps` checkout and processes a single uploaded image plus prompt.
+
+Set:
+
+```bash
+HAILO_VLM_BACKEND_MODE=direct
+HAILO_VLM_APP_DIR=/home/matamoe/hailo-apps
+```
+
+The older shell-command mode is still available if needed. In that case set `HAILO_VLM_COMMAND_TEMPLATE` to the exact Hailo app command for your installed `hailo-apps` version. The wrapper will substitute:
 
 - `{prompt}`
 - `{image_path}`
