@@ -663,6 +663,7 @@ def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: 
     }
     if chosen_mode == "test":
         payload["message"] = "Preview only. No robot command was executed."
+        payload["planned_steps"] = parsed.get("steps") or []
         _audit_robot_action("telegram", payload)
         return payload
     execution = _execute_robot_intent(parsed)

@@ -260,6 +260,7 @@
   function formatTelegramResult(payload) {
     if (!payload || typeof payload !== 'object') return String(payload || '');
     const preview = payload.preview || {};
+    const parsed = payload.parsed || {};
     const lines = [];
     lines.push(`Mode: ${payload.mode || 'unknown'}`);
     if (preview.target_scope === 'fleet') {
@@ -269,6 +270,19 @@
     }
     lines.push(`Action: ${preview.action || 'unknown'}`);
     if (preview.summary) lines.push(`Summary: ${preview.summary}`);
+    const steps = payload.planned_steps || parsed.steps || [];
+    if (Array.isArray(steps) && steps.length) {
+      lines.push('');
+      lines.push('Commands:');
+      steps.forEach((step, index) => {
+        const intent = step.intent || {};
+        lines.push(`${index + 1}. ${describeIntent(intent)}`);
+      });
+    } else if (parsed.intent) {
+      lines.push('');
+      lines.push('Commands:');
+      lines.push(`1. ${describeIntent(parsed.intent)}`);
+    }
     if (payload.message) {
       lines.push('');
       lines.push(payload.message);
