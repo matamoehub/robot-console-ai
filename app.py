@@ -14,7 +14,6 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from robot_brain import (
     EXECUTABLE_ACTIONS,
     TEST_ROBOT_BASE_URL,
-    TEST_ROBOT_ID,
     build_llm_parser_prompt,
     extract_json_object,
     load_robot_registry,
@@ -497,7 +496,7 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
     results: List[Dict[str, Any]] = []
     for robot in targets:
-        if str(robot.get("id") or "") == TEST_ROBOT_ID or bool(robot.get("test_mode")):
+        if bool(robot.get("test_mode")):
             preview_payload: Dict[str, Any] | None = None
             preview_path = ""
             preview_method = "POST"

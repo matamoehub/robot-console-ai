@@ -32,8 +32,53 @@ MASTER_MODES = [
     },
 ]
 
-TEST_ROBOT_ID = "TestRobot"
 TEST_ROBOT_BASE_URL = "http://test-robot.invalid"
+TEST_ROBOTS = [
+    {
+        "id": "TestTurboPi",
+        "base_url": TEST_ROBOT_BASE_URL,
+        "token": "",
+        "type": "Test TurboPi",
+        "robot_type": "turbopi",
+        "catalog_label": "Test TurboPi",
+        "hostname": "preview-only",
+        "ip": "",
+        "test_mode": True,
+    },
+    {
+        "id": "TestTonyPi",
+        "base_url": TEST_ROBOT_BASE_URL,
+        "token": "",
+        "type": "Test TonyPi",
+        "robot_type": "tonypi",
+        "catalog_label": "Test TonyPi",
+        "hostname": "preview-only",
+        "ip": "",
+        "test_mode": True,
+    },
+    {
+        "id": "TestSpiderPi",
+        "base_url": TEST_ROBOT_BASE_URL,
+        "token": "",
+        "type": "Test SpiderPi",
+        "robot_type": "spiderpi",
+        "catalog_label": "Test SpiderPi",
+        "hostname": "preview-only",
+        "ip": "",
+        "test_mode": True,
+    },
+    {
+        "id": "TestMentorPi",
+        "base_url": TEST_ROBOT_BASE_URL,
+        "token": "",
+        "type": "Test MentorPi",
+        "robot_type": "mentorpi",
+        "catalog_label": "Test MentorPi",
+        "hostname": "preview-only",
+        "ip": "",
+        "test_mode": True,
+    },
+]
 
 
 FAMILY_ALIASES = {
@@ -207,20 +252,7 @@ def load_robot_registry(path: Path) -> List[Dict[str, Any]]:
                 "ip": str(item.get("ip") or "").strip(),
             }
         )
-    out.insert(
-        0,
-        {
-            "id": TEST_ROBOT_ID,
-            "base_url": TEST_ROBOT_BASE_URL,
-            "token": "",
-            "type": "Test Robot",
-            "robot_type": "test",
-            "catalog_label": "Test Robot",
-            "hostname": "preview-only",
-            "ip": "",
-            "test_mode": True,
-        },
-    )
+    out = [*TEST_ROBOTS, *out]
     return out
 
 
