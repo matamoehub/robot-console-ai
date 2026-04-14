@@ -212,7 +212,6 @@
     lines.push(`Command: ${intent.summary || intent.action || 'unknown'}`);
     lines.push(`Targets: ${payload.target_count || 0}`);
     lines.push(`Overall status: ${payload.ok ? 'ok' : 'error'}`);
-    const parsed = payload.parsed || {};
     const familyInfo = familyCommandsForRobot(parsed.target_robot_id || '');
     if (familyInfo.commandsText) {
       lines.push('');
