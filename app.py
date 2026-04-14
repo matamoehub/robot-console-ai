@@ -6,10 +6,20 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from flask import Flask, flash, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
+
+from robot_brain import (
+    EXECUTABLE_ACTIONS,
+    build_llm_parser_prompt,
+    extract_json_object,
+    load_robot_registry,
+    normalize_llm_intent,
+    parse_text_command,
+    robot_catalog_payload,
+)
 
 APP_DIR = Path(__file__).resolve().parent
 APP = Flask(__name__, static_folder="static", template_folder="templates")
@@ -65,6 +75,13 @@ HAILO_OLLAMA_SERVICE_NAME = os.environ.get("HAILO_OLLAMA_SERVICE", "hailo-ollama
 VLM_SERVICE_UNIT_NAME = os.environ.get("VLM_SERVICE_NAME", "vlm-service").strip() or "vlm-service"
 HAILO_OLLAMA_API_BASE_URL = os.environ.get("HAILO_OLLAMA_API_BASE_URL", "http://127.0.0.1:8000").strip() or "http://127.0.0.1:8000"
 VLM_API_BASE_URL = os.environ.get("VLM_API_BASE_URL", "http://127.0.0.1:8090").strip() or "http://127.0.0.1:8090"
+ROBOT_REGISTRY_FILE = Path(
+    os.environ.get("ROBOT_REGISTRY_FILE", "/opt/robot/robot-console/robots.json")
+).expanduser()
+ROBOT_TEXT_COMMAND_MODEL = (
+    os.environ.get("ROBOT_TEXT_COMMAND_MODEL", "qwen2:1.5b").strip() or "qwen2:1.5b"
+)
+ROBOT_BRAIN_API_TOKEN = (os.environ.get("ROBOT_BRAIN_API_TOKEN") or "").strip()
 PASS_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_USER = os.environ.get("RCAI_USER", "admin").strip() or "admin"
 if not PASS_HASH_FILE.exists():
@@ -324,6 +341,160 @@ def _http_json_request(method: str, url: str, *, payload: Dict[str, Any] | None 
         }
     except Exception as exc:
         return {"ok": False, "url": url, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "error": str(exc)}
+
+
+def _api_token_ok(req) -> bool:
+    expected = (ROBOT_BRAIN_API_TOKEN or "").strip()
+    if not expected:
+        return False
+    supplied = (req.headers.get("X-Robot-Brain-Token") or "").strip()
+    if not supplied:
+        auth = (req.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            supplied = auth.split(" ", 1)[1].strip()
+    return bool(supplied) and secrets.compare_digest(supplied, expected)
+
+
+def _robot_registry() -> List[Dict[str, Any]]:
+    return load_robot_registry(ROBOT_REGISTRY_FILE)
+
+
+def _robot_by_id(robot_id: str) -> Optional[Dict[str, Any]]:
+    wanted = str(robot_id or "").strip()
+    if not wanted:
+        return None
+    for robot in _robot_registry():
+        if str(robot.get("id") or "").strip() == wanted:
+            return robot
+    return None
+
+
+def _robot_request(robot: Dict[str, Any], method: str, path: str, payload: Dict[str, Any] | None = None, timeout: float = 20.0) -> Dict[str, Any]:
+    base_url = str(robot.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return {"ok": False, "error": "robot_missing_base_url", "robot": robot}
+    url = f"{base_url}{path}"
+    started = time.perf_counter()
+    try:
+        import requests
+
+        headers = {}
+        token = str(robot.get("token") or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        kwargs: Dict[str, Any] = {"timeout": timeout, "headers": headers}
+        if payload is not None:
+            kwargs["json"] = payload
+        response = requests.request(method.upper(), url, **kwargs)
+        content_type = (response.headers.get("content-type") or "").lower()
+        data = response.json() if "application/json" in content_type else {"raw": response.text}
+        return {
+            "ok": response.ok,
+            "robot_id": robot.get("id"),
+            "url": url,
+            "status_code": response.status_code,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            "response": data,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "robot_id": robot.get("id"),
+            "url": url,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            "error": str(exc),
+        }
+
+
+def _robot_master_mode_status(robot: Dict[str, Any]) -> Dict[str, Any]:
+    return _robot_request(robot, "GET", "/api/admin/master-mode/status", timeout=10.0)
+
+
+def _parse_robot_text_with_llm(text: str, robots: List[Dict[str, Any]], preferred_robot_id: str = "") -> Dict[str, Any]:
+    prompt = build_llm_parser_prompt(text, robots, preferred_robot_id=preferred_robot_id)
+    llm_res = _hailo_ollama_chat(ROBOT_TEXT_COMMAND_MODEL, prompt, options={"num_predict": 192})
+    parsed_text = (((llm_res.get("response") or {}).get("message") or {}).get("content") or "").strip()
+    parsed_json = extract_json_object(parsed_text)
+    if not parsed_json:
+        return {
+            "ok": False,
+            "error": "llm_parse_failed",
+            "raw_text": parsed_text,
+            "llm": llm_res,
+        }
+    normalized = normalize_llm_intent(parsed_json, robots, preferred_robot_id=preferred_robot_id)
+    normalized["llm"] = llm_res
+    normalized["raw_text"] = parsed_text
+    return normalized
+
+
+def _parse_robot_text_request(text: str, preferred_robot_id: str = "", use_llm: bool = True) -> Dict[str, Any]:
+    robots = _robot_registry()
+    rule_result = parse_text_command(text, robots, preferred_robot_id=preferred_robot_id)
+    if rule_result.get("intent", {}).get("action") != "unknown":
+        rule_result["available_robots"] = robots
+        return rule_result
+    if not use_llm:
+        rule_result["available_robots"] = robots
+        return rule_result
+    mode = _hailo_mode_status()
+    if mode.get("active_mode") not in {"llm", "shared"}:
+        rule_result["available_robots"] = robots
+        rule_result["hint"] = "Switch Hailo mode to LLM for richer text-to-command parsing."
+        return rule_result
+    llm_result = _parse_robot_text_with_llm(text, robots, preferred_robot_id=preferred_robot_id)
+    llm_result["available_robots"] = robots
+    return llm_result
+
+
+def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    intent = parsed.get("intent") if isinstance(parsed.get("intent"), dict) else {}
+    action = str(intent.get("action") or "").strip()
+    args = intent.get("arguments") if isinstance(intent.get("arguments"), dict) else {}
+    target_scope = str(parsed.get("target_scope") or "single").strip().lower()
+    target_robot_id = str(parsed.get("target_robot_id") or "").strip()
+    robots = _robot_registry()
+
+    if action not in EXECUTABLE_ACTIONS:
+        return {"ok": False, "error": "intent_not_executable", "parsed": parsed}
+
+    targets = robots if target_scope == "fleet" else [robot for robot in robots if str(robot.get("id") or "") == target_robot_id]
+    if not targets:
+        return {"ok": False, "error": "target_robot_not_found", "parsed": parsed}
+
+    results: List[Dict[str, Any]] = []
+    for robot in targets:
+        if action == "say":
+            result = _robot_request(robot, "POST", "/api/cmd/say", {"text": str(args.get("text") or "").strip()}, timeout=20.0)
+        elif action == "soundoff":
+            result = _robot_request(robot, "POST", "/api/cmd/soundoff", {}, timeout=15.0)
+        elif action == "allstop":
+            result = _robot_request(robot, "POST", "/api/cmd/allstop", {}, timeout=15.0)
+        elif action == "master_mode":
+            result = _robot_request(robot, "POST", "/api/admin/master-mode/activate", {"mode": str(args.get("mode") or "").strip()}, timeout=20.0)
+        elif action == "camera_center":
+            result = _robot_request(robot, "POST", "/api/camera/center", {}, timeout=15.0)
+        elif action == "camera_nod":
+            result = _robot_request(robot, "POST", "/api/camera/nod", {"depth": float(args.get("depth") or 0.5), "speed_s": float(args.get("speed_s") or 0.25)}, timeout=15.0)
+        elif action == "camera_shake":
+            result = _robot_request(robot, "POST", "/api/camera/shake", {"width": float(args.get("width") or 0.5), "speed_s": float(args.get("speed_s") or 0.25)}, timeout=15.0)
+        elif action == "camera_wiggle":
+            result = _robot_request(robot, "POST", "/api/camera/wiggle", {"cycles": int(args.get("cycles") or 2), "amplitude": float(args.get("amplitude") or 0.3), "speed_s": float(args.get("speed_s") or 0.2)}, timeout=15.0)
+        elif action == "llm_service":
+            op = str(args.get("op") or "start").strip().lower()
+            result = _robot_request(robot, "POST", f"/api/service/play_llm/{op}", {}, timeout=20.0)
+            if not result.get("ok"):
+                result = _robot_request(robot, "POST", f"/api/service/ros_llm/{op}", {}, timeout=20.0)
+        else:
+            result = {"ok": False, "error": "unsupported_action", "action": action}
+        results.append(result)
+
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "parsed": parsed,
+        "results": results,
+        "target_count": len(results),
+    }
 
 
 def _hailo_ollama_models() -> Dict[str, Any]:
@@ -592,6 +763,9 @@ def api_admin_config():
             "pass_hash_file": str(PASS_HASH_FILE),
             "hailo_ollama_api_base_url": HAILO_OLLAMA_API_BASE_URL,
             "vlm_api_base_url": VLM_API_BASE_URL,
+            "robot_registry_file": str(ROBOT_REGISTRY_FILE),
+            "robot_text_command_model": ROBOT_TEXT_COMMAND_MODEL,
+            "robot_brain_api_token_configured": bool(ROBOT_BRAIN_API_TOKEN),
             "hailo_mode": _hailo_mode_status(),
             "services": AI_SERVICES,
         }
@@ -680,6 +854,100 @@ def api_admin_vlm_caption():
         }
         result = _vlm_caption_request(payload)
         result["mode"] = mode
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.get("/api/admin/robot-control/catalog")
+@need_login
+def api_admin_robot_control_catalog():
+    payload = robot_catalog_payload()
+    payload["registry_file"] = str(ROBOT_REGISTRY_FILE)
+    return jsonify(payload)
+
+
+@APP.get("/api/admin/robot-control/robots")
+@need_login
+def api_admin_robot_control_robots():
+    robots = _robot_registry()
+    enriched = []
+    for robot in robots:
+        item = dict(robot)
+        item["master_mode_status"] = _robot_master_mode_status(robot)
+        enriched.append(item)
+    return jsonify({"ok": True, "robots": enriched, "registry_file": str(ROBOT_REGISTRY_FILE)})
+
+
+@APP.post("/api/admin/robot-control/parse")
+@need_login
+def api_admin_robot_control_parse():
+    body = request.get_json(silent=True) or {}
+    text = str(body.get("text") or "").strip()
+    preferred_robot_id = str(body.get("robot_id") or "").strip()
+    use_llm = bool(body.get("use_llm", True))
+    result = _parse_robot_text_request(text, preferred_robot_id=preferred_robot_id, use_llm=use_llm)
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@APP.post("/api/admin/robot-control/execute")
+@need_login
+def api_admin_robot_control_execute():
+    body = request.get_json(silent=True) or {}
+    parsed = body.get("parsed") if isinstance(body.get("parsed"), dict) else None
+    if parsed is None:
+        text = str(body.get("text") or "").strip()
+        preferred_robot_id = str(body.get("robot_id") or "").strip()
+        use_llm = bool(body.get("use_llm", True))
+        parsed = _parse_robot_text_request(text, preferred_robot_id=preferred_robot_id, use_llm=use_llm)
+        if not parsed.get("ok"):
+            return jsonify(parsed), 400
+    result = _execute_robot_intent(parsed)
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.get("/api/brain/catalog")
+def api_brain_catalog():
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "invalid_api_token"}), 401
+    payload = robot_catalog_payload()
+    payload["registry_file"] = str(ROBOT_REGISTRY_FILE)
+    return jsonify(payload)
+
+
+@APP.get("/api/brain/robots")
+def api_brain_robots():
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "invalid_api_token"}), 401
+    return jsonify({"ok": True, "robots": _robot_registry()})
+
+
+@APP.post("/api/brain/parse")
+def api_brain_parse():
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "invalid_api_token"}), 401
+    body = request.get_json(silent=True) or {}
+    result = _parse_robot_text_request(
+        str(body.get("text") or "").strip(),
+        preferred_robot_id=str(body.get("robot_id") or "").strip(),
+        use_llm=bool(body.get("use_llm", True)),
+    )
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@APP.post("/api/brain/execute")
+def api_brain_execute():
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "invalid_api_token"}), 401
+    body = request.get_json(silent=True) or {}
+    parsed = body.get("parsed") if isinstance(body.get("parsed"), dict) else None
+    if parsed is None:
+        parsed = _parse_robot_text_request(
+            str(body.get("text") or "").strip(),
+            preferred_robot_id=str(body.get("robot_id") or "").strip(),
+            use_llm=bool(body.get("use_llm", True)),
+        )
+    if not parsed.get("ok"):
+        return jsonify(parsed), 400
+    result = _execute_robot_intent(parsed)
     return jsonify(result), (200 if result.get("ok") else 503)
 
 

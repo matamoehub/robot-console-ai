@@ -239,6 +239,104 @@ sudo systemctl restart vlm-service
 curl --silent http://127.0.0.1:8090/healthz
 ```
 
+## Robot command brain
+
+This repo can also act as the HQ-side text-to-command brain for your robots.
+
+The intended flow is:
+
+- `robot-console-ai` parses natural-language intent
+- it uses the local Hailo LLM when rules are not enough
+- it executes safe robot commands against each robot's `robot_ops_web`
+- Telegram or robot-side callers can use the same machine API
+
+The current admin page exposes a `Robot Command Brain` panel for:
+
+- selecting a robot from the shared registry
+- entering natural-language commands
+- parsing the command
+- executing the parsed command
+
+The current executable action set is:
+
+- robot speech
+- sound off
+- all stop
+- robot master-mode switching
+- robot LLM service start/stop
+- several camera motions
+
+The per-robot command catalogs also include the broader student library vocabularies from:
+
+- `MataTurboPi` `student_robot_v2`
+- `MataTonyPi` `student_robot_v2`
+- `MataSpiderPi` `student_robot_v2`
+- `MataMentorPi` `student_robot_v3`
+
+Those catalogs are used to help the parser understand commands, even where the robot-side execution API is not yet exposed.
+
+### Brain API
+
+Configure a machine token:
+
+```bash
+ROBOT_BRAIN_API_TOKEN=change-me-robot-brain-token
+ROBOT_REGISTRY_FILE=/opt/robot/robot-console/robots.json
+ROBOT_TEXT_COMMAND_MODEL=qwen2.5-instruct:1.5b
+```
+
+Then use:
+
+- `GET /api/brain/catalog`
+- `GET /api/brain/robots`
+- `POST /api/brain/parse`
+- `POST /api/brain/execute`
+
+Example:
+
+```bash
+curl -s http://127.0.0.1:8080/api/brain/execute \
+  -H 'Authorization: Bearer change-me-robot-brain-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"robot_id":"Mata01","text":"Put Mata01 into lesson mode"}'
+```
+
+### Voice routing recommendation
+
+For the current system, the most reliable split is:
+
+- robot: capture audio, wakeword/push-to-talk, send text or audio upstream
+- HQ Pi: run ASR/LLM/VLM orchestration and choose the robot command
+- robot: execute the command through `robot_ops_web`
+
+That keeps the fragile robot-side speech path as thin as possible while using the HQ Pi for the heavier, easier-to-update intelligence layer.
+
+### Telegram bot
+
+This repo also includes a simple Telegram polling bot:
+
+- script: `scripts/telegram_robot_bot.py`
+- unit: `deploy/systemd/telegram-robot-bot.service`
+
+Required env:
+
+```bash
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_ALLOWED_CHAT_IDS=12345,67890
+TELEGRAM_DEFAULT_ROBOT_ID=Mata01
+ROBOT_BRAIN_API_TOKEN=change-me-robot-brain-token
+ROBOT_BRAIN_API_BASE_URL=http://127.0.0.1:8080/api/brain
+```
+
+Install it on the Pi with:
+
+```bash
+sudo cp deploy/systemd/telegram-robot-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable telegram-robot-bot
+sudo systemctl restart telegram-robot-bot
+```
+
 ## Status
 
 This repo is intended as the dedicated AI admin companion to the main classroom `robot-console`.

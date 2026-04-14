@@ -145,6 +145,44 @@
       </div>
     </div>
   </div>
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <div class="fw-semibold">Robot Command Brain</div>
+          <span class="badge text-bg-dark">robot-console-ai -> robot_ops_web</span>
+        </div>
+        <div class="row g-3">
+          <div class="col-12 col-lg-3">
+            <label class="form-label" for="robotTarget">Robot</label>
+            <select id="robotTarget" class="form-select">
+              <option value="">Choose robot…</option>
+            </select>
+            <div class="form-text">Choose a robot, or mention a robot ID in the text.</div>
+          </div>
+          <div class="col-12 col-lg-7">
+            <label class="form-label" for="robotCommandText">Command</label>
+            <textarea id="robotCommandText" class="form-control" rows="4" placeholder="Examples: Put Mata01 into lesson mode. Tell Tony01 to say hello. Stop all robots. Center Mata02 camera."></textarea>
+            <div class="form-text">The parser understands robot IDs, master modes, speech, stop, sound off, LLM mode toggles, and several camera actions.</div>
+          </div>
+          <div class="col-12 col-lg-2">
+            <label class="form-label" for="robotUseLlm">Parser</label>
+            <div class="form-check">
+              <input id="robotUseLlm" class="form-check-input" type="checkbox" checked>
+              <label class="form-check-label" for="robotUseLlm">Use LLM fallback</label>
+            </div>
+            <div class="small text-muted mt-2">Rules are fastest. LLM helps with more natural phrasing.</div>
+          </div>
+        </div>
+        <div class="mt-3 d-flex gap-2 flex-wrap">
+          <button id="btnRobotCatalog" class="btn btn-outline-secondary btn-sm" type="button">Refresh Robots</button>
+          <button id="btnRobotParse" class="btn btn-outline-primary btn-sm" type="button">Parse Command</button>
+          <button id="btnRobotExecute" class="btn btn-primary btn-sm" type="button">Execute Command</button>
+        </div>
+        <pre id="robotBrainOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap;">(no robot command yet)</pre>
+      </div>
+    </div>
+  </div>
 </div>
 {% endblock %}
 {% block scripts %}
@@ -179,10 +217,18 @@
   const btnOpenCamera = document.getElementById('btnOpenCamera');
   const btnCaptureCamera = document.getElementById('btnCaptureCamera');
   const btnCloseCamera = document.getElementById('btnCloseCamera');
+  const robotTarget = document.getElementById('robotTarget');
+  const robotCommandText = document.getElementById('robotCommandText');
+  const robotUseLlm = document.getElementById('robotUseLlm');
+  const robotBrainOut = document.getElementById('robotBrainOut');
+  const btnRobotCatalog = document.getElementById('btnRobotCatalog');
+  const btnRobotParse = document.getElementById('btnRobotParse');
+  const btnRobotExecute = document.getElementById('btnRobotExecute');
   let updatePollTimer = null;
   let currentImageDataUrl = '';
   let cameraStream = null;
   let currentHailoMode = 'unknown';
+  let lastParsedRobotCommand = null;
 
   function show(v) {
     if (!out) return;
@@ -261,6 +307,11 @@
     vlmOut.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
   }
 
+  function showRobot(v) {
+    if (!robotBrainOut) return;
+    robotBrainOut.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  }
+
   function formatTiming(result) {
     const ms = Number(result && result.elapsed_ms);
     if (!Number.isFinite(ms)) return '';
@@ -283,6 +334,26 @@
       opt.textContent = model;
       select.appendChild(opt);
     });
+  }
+
+  function setRobotOptions(select, robots) {
+    if (!select) return;
+    const previous = select.value || '';
+    select.innerHTML = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'Choose robot…';
+    select.appendChild(placeholder);
+    (robots || []).forEach((robot) => {
+      const opt = document.createElement('option');
+      opt.value = String(robot.id || '');
+      const type = String(robot.catalog_label || robot.type || 'Robot');
+      opt.textContent = `${robot.id} · ${type}`;
+      select.appendChild(opt);
+    });
+    if (previous && Array.from(select.options).some((opt) => opt.value === previous)) {
+      select.value = previous;
+    }
   }
 
   function fileToDataUrl(file) {
@@ -429,6 +500,22 @@
     }
     renderHailoMode(j);
     return j;
+  }
+
+  async function refreshRobotCatalog() {
+    showRobot('Loading robot registry...');
+    const r = await fetch('/api/admin/robot-control/robots', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      showRobot(j || { error: `HTTP ${r.status}` });
+      return;
+    }
+    setRobotOptions(robotTarget, j.robots || []);
+    const summary = (j.robots || []).map((robot) => {
+      const mode = (((robot.master_mode_status || {}).response || {}).current_mode || {}).mode || 'unknown';
+      return `${robot.id} (${robot.catalog_label || robot.type || 'Robot'}) mode=${mode}`;
+    });
+    showRobot(summary.length ? `Loaded robots:\n${summary.join('\n')}` : 'No robots found in registry.');
   }
 
   function pollPostUpdate(baseOut) {
@@ -730,8 +817,79 @@
     }
   });
 
+  btnRobotCatalog?.addEventListener('click', refreshRobotCatalog);
+
+  btnRobotParse?.addEventListener('click', async () => {
+    const text = (robotCommandText?.value || '').trim();
+    if (!text) {
+      showRobot('Enter a robot command first.');
+      return;
+    }
+    btnRobotParse.disabled = true;
+    showRobot('Parsing robot command...');
+    try {
+      const r = await fetch('/api/admin/robot-control/parse', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          robot_id: (robotTarget?.value || '').trim(),
+          use_llm: !!robotUseLlm?.checked,
+        })
+      });
+      const j = await r.json().catch(() => ({}));
+      lastParsedRobotCommand = j;
+      if (!r.ok || !j.ok) {
+        showRobot(j);
+        return;
+      }
+      const intent = j.intent || {};
+      const target = j.target_scope === 'fleet' ? 'fleet' : (j.target_robot_id || 'no robot selected');
+      const summary = intent.summary || intent.action || 'unknown';
+      const executable = intent.executable ? 'yes' : 'no';
+      showRobot(`Target: ${target}\nAction: ${intent.action || 'unknown'}\nExecutable: ${executable}\nSummary: ${summary}\n\n${JSON.stringify(j, null, 2)}`);
+    } finally {
+      btnRobotParse.disabled = false;
+    }
+  });
+
+  btnRobotExecute?.addEventListener('click', async () => {
+    const text = (robotCommandText?.value || '').trim();
+    if (!text && !lastParsedRobotCommand) {
+      showRobot('Enter a robot command first.');
+      return;
+    }
+    btnRobotExecute.disabled = true;
+    showRobot('Executing robot command...');
+    try {
+      const body = lastParsedRobotCommand && lastParsedRobotCommand.ok
+        ? { parsed: lastParsedRobotCommand }
+        : {
+            text,
+            robot_id: (robotTarget?.value || '').trim(),
+            use_llm: !!robotUseLlm?.checked,
+          };
+      const r = await fetch('/api/admin/robot-control/execute', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        showRobot(j);
+        return;
+      }
+      showRobot(j);
+    } finally {
+      btnRobotExecute.disabled = false;
+    }
+  });
+
   await refreshServices();
   await refreshHailoMode();
+  await refreshRobotCatalog();
   window.addEventListener('beforeunload', stopCamera);
 })();
 </script>
