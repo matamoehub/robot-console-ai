@@ -13,6 +13,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from robot_brain import (
     EXECUTABLE_ACTIONS,
+    TEST_ROBOT_BASE_URL,
+    TEST_ROBOT_ID,
     build_llm_parser_prompt,
     extract_json_object,
     load_robot_registry,
@@ -465,6 +467,55 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
     results: List[Dict[str, Any]] = []
     for robot in targets:
+        if str(robot.get("id") or "") == TEST_ROBOT_ID or bool(robot.get("test_mode")):
+            preview_payload: Dict[str, Any] | None = None
+            preview_path = ""
+            preview_method = "POST"
+            if action == "say":
+                preview_path = "/api/cmd/say"
+                preview_payload = {"text": str(args.get("text") or "").strip()}
+            elif action == "soundoff":
+                preview_path = "/api/cmd/soundoff"
+                preview_payload = {}
+            elif action == "allstop":
+                preview_path = "/api/cmd/allstop"
+                preview_payload = {}
+            elif action == "master_mode":
+                preview_path = "/api/admin/master-mode/activate"
+                preview_payload = {"mode": str(args.get("mode") or "").strip()}
+            elif action == "camera_center":
+                preview_path = "/api/camera/center"
+                preview_payload = {}
+            elif action == "camera_nod":
+                preview_path = "/api/camera/nod"
+                preview_payload = {"depth": float(args.get("depth") or 0.5), "speed_s": float(args.get("speed_s") or 0.25)}
+            elif action == "camera_shake":
+                preview_path = "/api/camera/shake"
+                preview_payload = {"width": float(args.get("width") or 0.5), "speed_s": float(args.get("speed_s") or 0.25)}
+            elif action == "camera_wiggle":
+                preview_path = "/api/camera/wiggle"
+                preview_payload = {"cycles": int(args.get("cycles") or 2), "amplitude": float(args.get("amplitude") or 0.3), "speed_s": float(args.get("speed_s") or 0.2)}
+            elif action == "llm_service":
+                op = str(args.get("op") or "start").strip().lower()
+                preview_path = f"/api/service/play_llm/{op}"
+                preview_payload = {}
+            results.append(
+                {
+                    "ok": True,
+                    "robot_id": robot.get("id"),
+                    "preview_only": True,
+                    "url": f"{TEST_ROBOT_BASE_URL}{preview_path}",
+                    "method": preview_method,
+                    "would_send": preview_payload,
+                    "response": {
+                        "ok": True,
+                        "preview_only": True,
+                        "message": "Test robot selected. No live robot command was sent.",
+                    },
+                }
+            )
+            continue
+
         if action == "say":
             result = _robot_request(robot, "POST", "/api/cmd/say", {"text": str(args.get("text") or "").strip()}, timeout=20.0)
         elif action == "soundoff":

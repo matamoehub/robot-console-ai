@@ -32,6 +32,9 @@ MASTER_MODES = [
     },
 ]
 
+TEST_ROBOT_ID = "TestRobot"
+TEST_ROBOT_BASE_URL = "http://test-robot.invalid"
+
 
 FAMILY_ALIASES = {
     "turbopi": "turbopi",
@@ -204,6 +207,20 @@ def load_robot_registry(path: Path) -> List[Dict[str, Any]]:
                 "ip": str(item.get("ip") or "").strip(),
             }
         )
+    out.insert(
+        0,
+        {
+            "id": TEST_ROBOT_ID,
+            "base_url": TEST_ROBOT_BASE_URL,
+            "token": "",
+            "type": "Test Robot",
+            "robot_type": "test",
+            "catalog_label": "Test Robot",
+            "hostname": "preview-only",
+            "ip": "",
+            "test_mode": True,
+        },
+    )
     return out
 
 
