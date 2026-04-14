@@ -119,6 +119,83 @@
     el.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   }
 
+  function formatParseResult(payload) {
+    if (!payload || typeof payload !== 'object') return String(payload || '');
+    const intent = payload.intent || {};
+    const lines = [];
+    const target = payload.target_scope === 'fleet' ? 'All robots' : (payload.target_robot_id || 'No robot selected');
+    lines.push(`Target: ${target}`);
+    lines.push(`Action: ${intent.action || 'unknown'}`);
+    lines.push(`Executable: ${intent.executable ? 'yes' : 'no'}`);
+    if (intent.summary) lines.push(`Summary: ${intent.summary}`);
+    const args = intent.arguments || {};
+    const argKeys = Object.keys(args);
+    if (argKeys.length) {
+      lines.push('');
+      lines.push('Arguments:');
+      argKeys.forEach((key) => lines.push(`- ${key}: ${JSON.stringify(args[key])}`));
+    }
+    if (Array.isArray(payload.mentioned_robot_ids) && payload.mentioned_robot_ids.length) {
+      lines.push('');
+      lines.push(`Mentioned robots: ${payload.mentioned_robot_ids.join(', ')}`);
+    }
+    if (payload.source) {
+      lines.push(`Parser source: ${payload.source}`);
+    }
+    if (payload.hint) {
+      lines.push('');
+      lines.push(`Hint: ${payload.hint}`);
+    }
+    return lines.join('\n');
+  }
+
+  function formatExecutionResult(payload) {
+    if (!payload || typeof payload !== 'object') return String(payload || '');
+    const parsed = payload.parsed || {};
+    const intent = parsed.intent || {};
+    const lines = [];
+    lines.push(`Command: ${intent.summary || intent.action || 'unknown'}`);
+    lines.push(`Targets: ${payload.target_count || 0}`);
+    lines.push(`Overall status: ${payload.ok ? 'ok' : 'error'}`);
+    lines.push('');
+    lines.push('Results:');
+    (payload.results || []).forEach((item) => {
+      lines.push(`- ${item.robot_id || 'robot'}: ${item.ok ? 'ok' : 'failed'}`);
+      if (item.preview_only) {
+        lines.push(`  preview: ${item.method || 'POST'} ${item.url || ''}`);
+        if (item.would_send) lines.push(`  payload: ${JSON.stringify(item.would_send)}`);
+      } else {
+        if (item.url) lines.push(`  url: ${item.url}`);
+        if (typeof item.status_code === 'number') lines.push(`  status: ${item.status_code}`);
+        if (item.error) lines.push(`  error: ${item.error}`);
+      }
+    });
+    return lines.join('\n');
+  }
+
+  function formatTelegramResult(payload) {
+    if (!payload || typeof payload !== 'object') return String(payload || '');
+    const preview = payload.preview || {};
+    const lines = [];
+    lines.push(`Mode: ${payload.mode || 'unknown'}`);
+    if (preview.target_scope === 'fleet') {
+      lines.push('Target: All robots');
+    } else {
+      lines.push(`Target: ${preview.target_robot_id || 'No robot selected'}`);
+    }
+    lines.push(`Action: ${preview.action || 'unknown'}`);
+    if (preview.summary) lines.push(`Summary: ${preview.summary}`);
+    if (payload.message) {
+      lines.push('');
+      lines.push(payload.message);
+    }
+    if (payload.execution) {
+      lines.push('');
+      lines.push(formatExecutionResult(payload.execution));
+    }
+    return lines.join('\n');
+  }
+
   function setRobotOptions(select, robots) {
     if (!select) return;
     const previous = select.value || '';
@@ -206,7 +283,7 @@
     });
     const j = await r.json().catch(() => ({}));
     lastParsed = j;
-    show(directOut, j);
+    show(directOut, formatParseResult(j));
     return j;
   }
 
@@ -225,7 +302,7 @@
       body: JSON.stringify(payload)
     });
     const j = await r.json().catch(() => ({}));
-    show(directOut, j);
+    show(directOut, formatExecutionResult(j));
   }
 
   async function telegramDispatch(mode) {
@@ -246,7 +323,7 @@
       })
     });
     const j = await r.json().catch(() => ({}));
-    show(telegramOut, j);
+    show(telegramOut, formatTelegramResult(j));
   }
 
   btnRefreshRobots?.addEventListener('click', refreshRobots);
