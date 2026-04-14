@@ -61,8 +61,9 @@
         <div class="row g-3">
           <div class="col-12 col-lg-4">
             <label class="form-label" for="llmModel">Model</label>
-            <input id="llmModel" class="form-control" list="llmModelList" placeholder="qwen2:1.5b">
-            <datalist id="llmModelList"></datalist>
+            <select id="llmModel" class="form-select">
+              <option value="">Loading models...</option>
+            </select>
           </div>
           <div class="col-12 col-lg-8">
             <label class="form-label" for="llmPrompt">Prompt</label>
@@ -84,8 +85,9 @@
         <div class="row g-3">
           <div class="col-12 col-lg-3">
             <label class="form-label" for="vlmModel">Model</label>
-            <input id="vlmModel" class="form-control" list="vlmModelList" placeholder="local-vlm">
-            <datalist id="vlmModelList"></datalist>
+            <select id="vlmModel" class="form-select">
+              <option value="">Loading models...</option>
+            </select>
           </div>
           <div class="col-12 col-lg-3">
             <label class="form-label" for="vlmPrompt">Prompt</label>
@@ -130,13 +132,11 @@
   const btnRunTests = document.getElementById('btnRunTests');
   const btnUpdateRestart = document.getElementById('btnUpdateRestart');
   const llmModel = document.getElementById('llmModel');
-  const llmModelList = document.getElementById('llmModelList');
   const llmPrompt = document.getElementById('llmPrompt');
   const llmOut = document.getElementById('llmOut');
   const btnLlmAsk = document.getElementById('btnLlmAsk');
   const btnLlmModels = document.getElementById('btnLlmModels');
   const vlmModel = document.getElementById('vlmModel');
-  const vlmModelList = document.getElementById('vlmModelList');
   const vlmPrompt = document.getElementById('vlmPrompt');
   const vlmImage = document.getElementById('vlmImage');
   const vlmPreview = document.getElementById('vlmPreview');
@@ -168,13 +168,21 @@
     vlmOut.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
   }
 
-  function setModelOptions(datalist, models) {
-    if (!datalist) return;
-    datalist.innerHTML = '';
+  function setModelOptions(select, models) {
+    if (!select) return;
+    select.innerHTML = '';
+    if (!(models || []).length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No models available';
+      select.appendChild(opt);
+      return;
+    }
     (models || []).forEach((model) => {
       const opt = document.createElement('option');
       opt.value = model;
-      datalist.appendChild(opt);
+      opt.textContent = model;
+      select.appendChild(opt);
     });
   }
 
@@ -231,7 +239,7 @@
       return;
     }
     const models = extractLlmModels(j);
-    setModelOptions(llmModelList, models);
+    setModelOptions(llmModel, models);
     if (llmModel && !llmModel.value && models[0]) llmModel.value = models[0];
     showLlm(models.length ? `Loaded models: ${models.join(', ')}` : j);
   }
@@ -245,7 +253,7 @@
       return;
     }
     const models = extractVlmModels(j);
-    setModelOptions(vlmModelList, models);
+    setModelOptions(vlmModel, models);
     if (vlmModel && !vlmModel.value && models[0]) vlmModel.value = models[0];
     showVlm(models.length ? `Loaded models: ${models.join(', ')}` : j);
   }
