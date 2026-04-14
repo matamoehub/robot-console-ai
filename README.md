@@ -257,6 +257,17 @@ The current admin page exposes a `Robot Command Brain` panel for:
 - parsing the command
 - executing the parsed command
 
+There is also a dedicated page for robot and Telegram testing:
+
+- `/admin/robot-control`
+
+That page gives you:
+
+- direct robot-command testing
+- Telegram message simulation
+- test mode preview without touching the robot
+- live mode execution against a connected robot
+
 The current executable action set is:
 
 - robot speech
@@ -291,6 +302,7 @@ Then use:
 - `GET /api/brain/robots`
 - `POST /api/brain/parse`
 - `POST /api/brain/execute`
+- `POST /api/brain/telegram/ingest`
 
 Example:
 
@@ -324,6 +336,7 @@ Required env:
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ALLOWED_CHAT_IDS=12345,67890
 TELEGRAM_DEFAULT_ROBOT_ID=Mata01
+TELEGRAM_EXECUTION_MODE=live
 ROBOT_BRAIN_API_TOKEN=change-me-robot-brain-token
 ROBOT_BRAIN_API_BASE_URL=http://127.0.0.1:8080/api/brain
 ```

@@ -17,6 +17,7 @@ ROBOT_BRAIN_API_BASE_URL = (
     os.environ.get("ROBOT_BRAIN_API_BASE_URL") or "http://127.0.0.1:8080/api/brain"
 ).strip().rstrip("/")
 ROBOT_BRAIN_API_TOKEN = (os.environ.get("ROBOT_BRAIN_API_TOKEN") or "").strip()
+TELEGRAM_EXECUTION_MODE = (os.environ.get("TELEGRAM_EXECUTION_MODE") or "live").strip().lower()
 
 
 def _telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -26,10 +27,17 @@ def _telegram_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return response.json()
 
 
-def _brain_execute(text: str, robot_id: str = "") -> Dict[str, Any]:
+def _brain_execute(text: str, robot_id: str = "", *, chat_id: int = 0, display_name: str = "", username: str = "") -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {ROBOT_BRAIN_API_TOKEN}"} if ROBOT_BRAIN_API_TOKEN else {}
-    payload = {"text": text, "robot_id": robot_id or TELEGRAM_DEFAULT_ROBOT_ID, "use_llm": True}
-    response = requests.post(f"{ROBOT_BRAIN_API_BASE_URL}/execute", json=payload, headers=headers, timeout=90)
+    payload = {
+        "text": text,
+        "robot_id": robot_id or TELEGRAM_DEFAULT_ROBOT_ID,
+        "mode": TELEGRAM_EXECUTION_MODE,
+        "chat_id": chat_id,
+        "display_name": display_name,
+        "username": username,
+    }
+    response = requests.post(f"{ROBOT_BRAIN_API_BASE_URL}/telegram/ingest", json=payload, headers=headers, timeout=90)
     return {"status_code": response.status_code, "data": response.json()}
 
 
@@ -38,13 +46,16 @@ def _format_result(result: Dict[str, Any]) -> str:
     if not data.get("ok"):
         return f"Command failed:\n{data}"
     parsed = data.get("parsed") if isinstance(data.get("parsed"), dict) else {}
-    intent = parsed.get("intent") if isinstance(parsed.get("intent"), dict) else {}
-    summary = str(intent.get("summary") or intent.get("action") or "done")
-    lines = [f"Command: {summary}"]
-    for item in data.get("results") or []:
+    preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    summary = str(preview.get("summary") or ((parsed.get("intent") or {}).get("summary")) or "done")
+    lines = [f"Command: {summary}", f"Mode: {data.get('mode') or TELEGRAM_EXECUTION_MODE}"]
+    execution = data.get("execution") if isinstance(data.get("execution"), dict) else {}
+    for item in execution.get("results") or []:
         robot_id = str(item.get("robot_id") or "robot")
         status = "ok" if item.get("ok") else "failed"
         lines.append(f"- {robot_id}: {status}")
+    if data.get("mode") == "test":
+        lines.append("Preview only. No live robot command was sent.")
     return "\n".join(lines)
 
 
@@ -76,7 +87,13 @@ def main() -> int:
                 if not _allowed(chat_id):
                     _telegram_api("sendMessage", {"chat_id": chat_id, "text": "This chat is not allowed to control robots."})
                     continue
-                result = _brain_execute(text)
+                from_user = message.get("from") or {}
+                result = _brain_execute(
+                    text,
+                    chat_id=chat_id,
+                    display_name=str(chat.get("title") or from_user.get("first_name") or "").strip(),
+                    username=str(from_user.get("username") or "").strip(),
+                )
                 _telegram_api("sendMessage", {"chat_id": chat_id, "text": _format_result(result)})
         except Exception as exc:
             time.sleep(3.0)

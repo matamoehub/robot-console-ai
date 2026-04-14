@@ -82,6 +82,7 @@ ROBOT_TEXT_COMMAND_MODEL = (
     os.environ.get("ROBOT_TEXT_COMMAND_MODEL", "qwen2:1.5b").strip() or "qwen2:1.5b"
 )
 ROBOT_BRAIN_API_TOKEN = (os.environ.get("ROBOT_BRAIN_API_TOKEN") or "").strip()
+TELEGRAM_EXECUTION_MODE = (os.environ.get("TELEGRAM_EXECUTION_MODE", "live").strip() or "live").lower()
 PASS_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_USER = os.environ.get("RCAI_USER", "admin").strip() or "admin"
 if not PASS_HASH_FILE.exists():
@@ -497,6 +498,34 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    chosen_mode = (mode or "test").strip().lower()
+    if chosen_mode not in {"test", "live"}:
+        return {"ok": False, "error": "invalid_mode", "mode": chosen_mode}
+    parsed = _parse_robot_text_request(text, preferred_robot_id=robot_id, use_llm=True)
+    if not parsed.get("ok"):
+        return {"ok": False, "mode": chosen_mode, "sender": sender or {}, "parsed": parsed}
+    payload = {
+        "ok": True,
+        "mode": chosen_mode,
+        "sender": sender or {},
+        "parsed": parsed,
+        "preview": {
+            "target_scope": parsed.get("target_scope"),
+            "target_robot_id": parsed.get("target_robot_id"),
+            "summary": ((parsed.get("intent") or {}).get("summary") or ""),
+            "action": ((parsed.get("intent") or {}).get("action") or ""),
+        },
+    }
+    if chosen_mode == "test":
+        payload["message"] = "Preview only. No robot command was executed."
+        return payload
+    execution = _execute_robot_intent(parsed)
+    payload["execution"] = execution
+    payload["ok"] = bool(execution.get("ok"))
+    return payload
+
+
 def _hailo_ollama_models() -> Dict[str, Any]:
     return _http_json_request("GET", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list", timeout=20.0)
 
@@ -655,18 +684,28 @@ def _hailo_mode_status() -> Dict[str, Any]:
 
 def _service_logs(item: Dict[str, Any], lines: int = 120) -> Dict[str, Any]:
     lines = max(10, min(int(lines), 500))
-    cmd = ["journalctl", "-u", item.get("journal_unit") or item["service_name"], "-n", str(lines), "--no-pager"]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=12.0, check=False)
-        return {
-            "ok": p.returncode == 0,
-            "cmd": " ".join(shlex.quote(x) for x in cmd),
-            "returncode": p.returncode,
-            "stdout": (p.stdout or "").strip(),
-            "stderr": (p.stderr or "").strip(),
-        }
-    except Exception as exc:
-        return {"ok": False, "cmd": " ".join(shlex.quote(x) for x in cmd), "error": str(exc)}
+    unit = item.get("journal_unit") or item["service_name"]
+    attempts = [
+        ["journalctl", "-u", unit, "-n", str(lines), "--no-pager"],
+        ["sudo", "-n", "journalctl", "-u", unit, "-n", str(lines), "--no-pager"],
+    ]
+    last: Dict[str, Any] | None = None
+    for cmd in attempts:
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=12.0, check=False)
+            result = {
+                "ok": p.returncode == 0,
+                "cmd": " ".join(shlex.quote(x) for x in cmd),
+                "returncode": p.returncode,
+                "stdout": (p.stdout or "").strip(),
+                "stderr": (p.stderr or "").strip(),
+            }
+            if result["ok"]:
+                return result
+            last = result
+        except Exception as exc:
+            last = {"ok": False, "cmd": " ".join(shlex.quote(x) for x in cmd), "error": str(exc)}
+    return last or {"ok": False, "cmd": "journalctl", "error": "journalctl_failed"}
 
 
 @APP.context_processor
@@ -714,6 +753,17 @@ def admin_page():
         service_name=APP_SERVICE_NAME,
         repo_dir=str(APP_REPO_DIR),
         ai_services=AI_SERVICES,
+    )
+
+
+@APP.get("/admin/robot-control")
+@need_login
+def admin_robot_control_page():
+    return render_template(
+        "robot_control.html",
+        service_name=APP_SERVICE_NAME,
+        repo_dir=str(APP_REPO_DIR),
+        telegram_execution_mode=TELEGRAM_EXECUTION_MODE,
     )
 
 
@@ -904,6 +954,19 @@ def api_admin_robot_control_execute():
     return jsonify(result), (200 if result.get("ok") else 503)
 
 
+@APP.post("/api/admin/telegram/dispatch")
+@need_login
+def api_admin_telegram_dispatch():
+    body = request.get_json(silent=True) or {}
+    result = _telegram_ingest(
+        str(body.get("text") or "").strip(),
+        robot_id=str(body.get("robot_id") or "").strip(),
+        mode=str(body.get("mode") or "test").strip(),
+        sender={"source": "admin", "display_name": str(body.get("display_name") or "admin").strip()},
+    )
+    return jsonify(result), (200 if result.get("ok") else 503 if str(result.get("mode") or "") == "live" else 400)
+
+
 @APP.get("/api/brain/catalog")
 def api_brain_catalog():
     if not _api_token_ok(request):
@@ -949,6 +1012,25 @@ def api_brain_execute():
         return jsonify(parsed), 400
     result = _execute_robot_intent(parsed)
     return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/brain/telegram/ingest")
+def api_brain_telegram_ingest():
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "invalid_api_token"}), 401
+    body = request.get_json(silent=True) or {}
+    result = _telegram_ingest(
+        str(body.get("text") or "").strip(),
+        robot_id=str(body.get("robot_id") or "").strip(),
+        mode=str(body.get("mode") or TELEGRAM_EXECUTION_MODE).strip(),
+        sender={
+            "source": "telegram",
+            "chat_id": body.get("chat_id"),
+            "display_name": str(body.get("display_name") or "").strip(),
+            "username": str(body.get("username") or "").strip(),
+        },
+    )
+    return jsonify(result), (200 if result.get("ok") else 503 if str(result.get("mode") or "") == "live" else 400)
 
 
 @APP.post("/api/admin/update-restart")
