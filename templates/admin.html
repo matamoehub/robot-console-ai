@@ -76,9 +76,17 @@
               <option value="llama3.2:3b">llama3.2:3b</option>
             </select>
           </div>
-          <div class="col-12 col-lg-8">
+          <div class="col-12 col-lg-5">
             <label class="form-label" for="llmPrompt">Prompt</label>
-            <textarea id="llmPrompt" class="form-control" rows="4" placeholder="Ask the local LLM a question."></textarea>
+            <textarea id="llmPrompt" class="form-control" rows="4" placeholder="Ask the local LLM a question. Short prompts are fastest."></textarea>
+          </div>
+          <div class="col-12 col-lg-3">
+            <label class="form-label" for="llmMaxTokens">Max Tokens</label>
+            <input id="llmMaxTokens" class="form-control" type="number" min="1" max="512" step="1" value="48">
+            <div class="form-check mt-2">
+              <input id="llmShortAnswer" class="form-check-input" type="checkbox" checked>
+              <label class="form-check-label" for="llmShortAnswer">Short answer mode</label>
+            </div>
           </div>
         </div>
         <div class="mt-3 d-flex gap-2 flex-wrap">
@@ -153,6 +161,8 @@
   const btnModeVlm = document.getElementById('btnModeVlm');
   const llmModel = document.getElementById('llmModel');
   const llmPrompt = document.getElementById('llmPrompt');
+  const llmMaxTokens = document.getElementById('llmMaxTokens');
+  const llmShortAnswer = document.getElementById('llmShortAnswer');
   const llmOut = document.getElementById('llmOut');
   const btnLlmAsk = document.getElementById('btnLlmAsk');
   const btnLlmModels = document.getElementById('btnLlmModels');
@@ -223,7 +233,7 @@
     const llmEnabled = currentHailoMode === 'llm' || currentHailoMode === 'shared';
     const vlmEnabled = currentHailoMode === 'vlm' || currentHailoMode === 'shared';
 
-    [llmModel, llmPrompt, btnLlmAsk, btnLlmModels].forEach((el) => {
+    [llmModel, llmPrompt, llmMaxTokens, llmShortAnswer, btnLlmAsk, btnLlmModels].forEach((el) => {
       if (el) el.disabled = !llmEnabled;
     });
 
@@ -531,6 +541,8 @@
   btnLlmAsk?.addEventListener('click', async () => {
     const prompt = (llmPrompt?.value || '').trim();
     const model = (llmModel?.value || '').trim();
+    const maxTokens = Math.max(1, Math.min(512, Number(llmMaxTokens?.value || 48) || 48));
+    const shortAnswer = !!llmShortAnswer?.checked;
     if (!prompt) {
       showLlm('Enter a prompt first.');
       return;
@@ -546,7 +558,7 @@
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, prompt })
+        body: JSON.stringify({ model, prompt, max_tokens: maxTokens, short_answer: shortAnswer })
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j.ok) {

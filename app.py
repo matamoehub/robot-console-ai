@@ -334,12 +334,14 @@ def _hailo_ollama_installed_models() -> Dict[str, Any]:
     return _http_json_request("GET", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/api/tags", timeout=20.0)
 
 
-def _hailo_ollama_chat(model: str, prompt: str) -> Dict[str, Any]:
+def _hailo_ollama_chat(model: str, prompt: str, options: Dict[str, Any] | None = None) -> Dict[str, Any]:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
     }
+    if options:
+        payload["options"] = options
     return _http_json_request("POST", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/api/chat", payload=payload, timeout=120.0)
 
 
@@ -626,16 +628,21 @@ def api_admin_llm_chat():
     body = request.get_json(silent=True) or {}
     prompt = str(body.get("prompt") or "").strip()
     model = str(body.get("model") or "").strip()
+    max_tokens = max(1, min(int(body.get("max_tokens") or 64), 512))
+    short_answer = bool(body.get("short_answer"))
     if not prompt:
         return jsonify({"ok": False, "error": "missing_prompt"}), 400
     if not model:
         return jsonify({"ok": False, "error": "missing_model"}), 400
+    if short_answer:
+        prompt = f"{prompt.rstrip()}\n\nReply briefly. Use at most one short sentence."
     with HAILO_DEVICE_LOCK:
         mode = _hailo_mode_status()
         if mode.get("active_mode") not in {"llm", "shared"}:
             return jsonify({"ok": False, "error": "hailo_mode_not_llm", "mode": mode}), 503
-        result = _hailo_ollama_chat(model, prompt)
+        result = _hailo_ollama_chat(model, prompt, options={"num_predict": max_tokens})
         result["mode"] = mode
+        result["request"] = {"model": model, "max_tokens": max_tokens, "short_answer": short_answer}
     return jsonify(result), (200 if result.get("ok") else 503)
 
 
