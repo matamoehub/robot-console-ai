@@ -15,7 +15,7 @@
         <div><a href="/admin">/admin</a></div>
         <div><a href="/logs">/logs</a></div>
         <div class="fw-semibold mt-3 mb-2">Hailo Mode</div>
-        <div id="hailoModeBadge" class="mono small">Loading...</div>
+        <div id="hailoModeBadge" class="mode-pill inactive">Loading...</div>
         <div class="mt-3">
           <button id="btnRunTests" class="btn btn-outline-success btn-sm" type="button">Run Tests</button>
           <button id="btnUpdateRestart" class="btn btn-danger btn-sm" type="button">Git Sync + Restart</button>
@@ -63,7 +63,10 @@
   <div class="col-12 col-xl-8">
     <div class="card h-100">
       <div class="card-body">
-        <div class="fw-semibold mb-3">LLM Test</div>
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <div class="fw-semibold">LLM Test</div>
+          <span id="llmModeBadge" class="mode-pill inactive">LLM idle</span>
+        </div>
         <div class="row g-3">
           <div class="col-12 col-lg-4">
             <label class="form-label" for="llmModel">Model</label>
@@ -89,7 +92,10 @@
   <div class="col-12">
     <div class="card">
       <div class="card-body">
-        <div class="fw-semibold mb-3">VLM Test</div>
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <div class="fw-semibold">VLM Test</div>
+          <span id="vlmModeBadge" class="mode-pill inactive">VLM idle</span>
+        </div>
         <div class="row g-3">
           <div class="col-12 col-lg-3">
             <label class="form-label" for="vlmModel">Model</label>
@@ -137,7 +143,10 @@
 <script>
 (async function () {
   const out = document.getElementById('adminOut');
+  const navModeBadge = document.getElementById('navModeBadge');
   const hailoModeBadge = document.getElementById('hailoModeBadge');
+  const llmModeBadge = document.getElementById('llmModeBadge');
+  const vlmModeBadge = document.getElementById('vlmModeBadge');
   const btnRunTests = document.getElementById('btnRunTests');
   const btnUpdateRestart = document.getElementById('btnUpdateRestart');
   const btnModeLlm = document.getElementById('btnModeLlm');
@@ -163,6 +172,7 @@
   let updatePollTimer = null;
   let currentImageDataUrl = '';
   let cameraStream = null;
+  let currentHailoMode = 'unknown';
 
   function show(v) {
     if (!out) return;
@@ -170,9 +180,65 @@
   }
 
   function renderHailoMode(status) {
-    if (!hailoModeBadge) return;
     const mode = String((status && status.active_mode) || 'unknown');
-    hailoModeBadge.textContent = mode;
+    currentHailoMode = mode;
+    const apply = (el, text, className) => {
+      if (!el) return;
+      el.textContent = text;
+      el.className = `mode-pill ${className}`;
+    };
+
+    if (mode === 'llm') {
+      apply(navModeBadge, 'Mode: LLM', 'active-llm');
+      apply(hailoModeBadge, 'LLM active', 'active-llm');
+      apply(llmModeBadge, 'LLM active', 'active-llm');
+      apply(vlmModeBadge, 'VLM inactive', 'inactive');
+      syncModeAvailability();
+      return;
+    }
+    if (mode === 'vlm') {
+      apply(navModeBadge, 'Mode: VLM', 'active-vlm');
+      apply(hailoModeBadge, 'VLM active', 'active-vlm');
+      apply(llmModeBadge, 'LLM inactive', 'inactive');
+      apply(vlmModeBadge, 'VLM active', 'active-vlm');
+      syncModeAvailability();
+      return;
+    }
+    if (mode === 'shared') {
+      apply(navModeBadge, 'Mode: shared', 'active-llm');
+      apply(hailoModeBadge, 'Shared mode', 'active-llm');
+      apply(llmModeBadge, 'LLM available', 'active-llm');
+      apply(vlmModeBadge, 'VLM available', 'active-vlm');
+      syncModeAvailability();
+      return;
+    }
+    apply(navModeBadge, 'Mode: unknown', 'inactive');
+    apply(hailoModeBadge, 'Unknown', 'inactive');
+    apply(llmModeBadge, 'LLM idle', 'inactive');
+    apply(vlmModeBadge, 'VLM idle', 'inactive');
+    syncModeAvailability();
+  }
+
+  function syncModeAvailability() {
+    const llmEnabled = currentHailoMode === 'llm' || currentHailoMode === 'shared';
+    const vlmEnabled = currentHailoMode === 'vlm' || currentHailoMode === 'shared';
+
+    [llmModel, llmPrompt, btnLlmAsk, btnLlmModels].forEach((el) => {
+      if (el) el.disabled = !llmEnabled;
+    });
+
+    [vlmModel, vlmPrompt, vlmImage, btnVlmAsk, btnVlmModels, btnVlmClear, btnOpenCamera].forEach((el) => {
+      if (el) el.disabled = !vlmEnabled;
+    });
+
+    if (!vlmEnabled) {
+      if (btnCaptureCamera) btnCaptureCamera.disabled = true;
+      if (btnCloseCamera) btnCloseCamera.disabled = true;
+      stopCamera();
+    } else if (cameraStream) {
+      if (btnCaptureCamera) btnCaptureCamera.disabled = false;
+      if (btnCloseCamera) btnCloseCamera.disabled = false;
+    }
   }
 
   function showLlm(v) {

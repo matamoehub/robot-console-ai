@@ -8,6 +8,10 @@
   <style>
     body { background: #f4f7fb; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .mode-pill { border: 1px solid #cbd5e1; background: #ffffff; color: #475569; padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
+    .mode-pill.active-llm { background: #dcfce7; border-color: #86efac; color: #166534; }
+    .mode-pill.active-vlm { background: #dbeafe; border-color: #93c5fd; color: #1d4ed8; }
+    .mode-pill.inactive { background: #f8fafc; border-color: #e2e8f0; color: #94a3b8; }
   </style>
 </head>
 <body>
@@ -19,6 +23,7 @@
       <a class="nav-link" href="/logs">Logs</a>
     </div>
     <div class="d-flex align-items-center gap-2">
+      <span id="navModeBadge" class="mode-pill inactive">Mode: unknown</span>
       <span class="badge text-bg-secondary">AI v{{ app_version }}</span>
       {% if session.get('user') %}
         <span class="text-muted small mono">{{ session.get('user') }}</span>
