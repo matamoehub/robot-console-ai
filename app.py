@@ -3,6 +3,7 @@ import os
 import secrets
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -60,6 +61,8 @@ APP_RESTART_SCRIPT = Path(os.environ.get("ROBOT_CONSOLE_AI_RESTART_SCRIPT", "/op
 UPDATE_TEST_LOG_PATH = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_TEST_LOG_PATH", "/tmp/robot-console-ai-update-tests.log")).expanduser()
 UPDATE_TEST_RC_PATH = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_TEST_RC_PATH", "/tmp/robot-console-ai-update-tests.rc")).expanduser()
 PASS_HASH_FILE = Path(os.environ.get("PASS_HASH_FILE", "/opt/robot/etc/robot-console-ai.passhash")).expanduser()
+HAILO_OLLAMA_SERVICE_NAME = os.environ.get("HAILO_OLLAMA_SERVICE", "hailo-ollama").strip() or "hailo-ollama"
+VLM_SERVICE_UNIT_NAME = os.environ.get("VLM_SERVICE_NAME", "vlm-service").strip() or "vlm-service"
 HAILO_OLLAMA_API_BASE_URL = os.environ.get("HAILO_OLLAMA_API_BASE_URL", "http://127.0.0.1:8000").strip() or "http://127.0.0.1:8000"
 VLM_API_BASE_URL = os.environ.get("VLM_API_BASE_URL", "http://127.0.0.1:8090").strip() or "http://127.0.0.1:8090"
 PASS_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +137,7 @@ def _load_ai_services() -> List[Dict[str, Any]]:
 
 AI_SERVICES = _load_ai_services()
 AI_SERVICE_MAP = {svc["key"]: svc for svc in AI_SERVICES}
+HAILO_DEVICE_LOCK = threading.RLock()
 
 
 def need_login(fn):
@@ -317,10 +321,15 @@ def _hailo_ollama_models() -> Dict[str, Any]:
     return _http_json_request("GET", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list", timeout=20.0)
 
 
+def _hailo_ollama_installed_models() -> Dict[str, Any]:
+    return _http_json_request("GET", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/api/tags", timeout=20.0)
+
+
 def _hailo_ollama_chat(model: str, prompt: str) -> Dict[str, Any]:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
     }
     return _http_json_request("POST", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/api/chat", payload=payload, timeout=120.0)
 
@@ -389,6 +398,45 @@ def _service_action(item: Dict[str, Any], action: str) -> Dict[str, Any]:
         "result": result,
         "status": _service_status(item),
     }
+
+
+def _wait_for_health(url: str, expect_ok: bool = True, timeout_s: float = 25.0) -> Dict[str, Any]:
+    deadline = time.time() + timeout_s
+    last = {"ok": False, "url": url}
+    while time.time() < deadline:
+        last = _service_health(url)
+        if bool(last.get("ok")) == expect_ok:
+            return {"ok": True, "health": last}
+        time.sleep(0.5)
+    return {"ok": False, "health": last, "timeout_s": timeout_s}
+
+
+def _switch_hailo_mode(target: str) -> Dict[str, Any]:
+    target = (target or "").strip().lower()
+    if target not in {"llm", "vlm"}:
+        return {"ok": False, "error": "invalid_hailo_target"}
+    desired_service = HAILO_OLLAMA_SERVICE_NAME if target == "llm" else VLM_SERVICE_UNIT_NAME
+    other_service = VLM_SERVICE_UNIT_NAME if target == "llm" else HAILO_OLLAMA_SERVICE_NAME
+    desired_health = HAILO_OLLAMA_API_BASE_URL.rstrip("/") + "/hailo/v1/list" if target == "llm" else VLM_API_BASE_URL.rstrip("/") + "/healthz"
+
+    with HAILO_DEVICE_LOCK:
+        steps = []
+        stop_other = _systemctl_run(["stop", other_service], timeout=30.0)
+        steps.append({"service": other_service, "action": "stop", **stop_other})
+        if not stop_other.get("ok"):
+            return {"ok": False, "error": "stop_other_failed", "target": target, "steps": steps}
+
+        start_desired = _systemctl_run(["restart", desired_service], timeout=30.0)
+        steps.append({"service": desired_service, "action": "restart", **start_desired})
+        if not start_desired.get("ok"):
+            return {"ok": False, "error": "restart_desired_failed", "target": target, "steps": steps}
+
+        health = _wait_for_health(desired_health, expect_ok=True, timeout_s=25.0)
+        steps.append({"service": desired_service, "action": "health_wait", **health})
+        if not health.get("ok"):
+            return {"ok": False, "error": "desired_health_failed", "target": target, "steps": steps}
+
+        return {"ok": True, "target": target, "steps": steps}
 
 
 def _service_logs(item: Dict[str, Any], lines: int = 120) -> Dict[str, Any]:
@@ -509,7 +557,9 @@ def api_admin_config():
 @APP.get("/api/admin/llm/models")
 @need_login
 def api_admin_llm_models():
-    result = _hailo_ollama_models()
+    result = _hailo_ollama_installed_models()
+    if not result.get("ok"):
+        result = _hailo_ollama_models()
     return jsonify(result), (200 if result.get("ok") else 503)
 
 
@@ -523,7 +573,12 @@ def api_admin_llm_chat():
         return jsonify({"ok": False, "error": "missing_prompt"}), 400
     if not model:
         return jsonify({"ok": False, "error": "missing_model"}), 400
-    result = _hailo_ollama_chat(model, prompt)
+    with HAILO_DEVICE_LOCK:
+        switch = _switch_hailo_mode("llm")
+        if not switch.get("ok"):
+            return jsonify({"ok": False, "error": "hailo_mode_switch_failed", "switch": switch}), 503
+        result = _hailo_ollama_chat(model, prompt)
+        result["switch"] = switch
     return jsonify(result), (200 if result.get("ok") else 503)
 
 
@@ -543,19 +598,24 @@ def api_admin_vlm_caption():
     model = str(body.get("model") or os.environ.get("VLM_MODEL_ID", "local-vlm")).strip() or "local-vlm"
     if not image_data_url:
         return jsonify({"ok": False, "error": "missing_image_data_url"}), 400
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt or DEFAULT_AI_SERVICES[1]["description"]},
-                    {"type": "image_url", "image_url": {"url": image_data_url}},
-                ],
-            }
-        ],
-    }
-    result = _vlm_caption_request(payload)
+    with HAILO_DEVICE_LOCK:
+        switch = _switch_hailo_mode("vlm")
+        if not switch.get("ok"):
+            return jsonify({"ok": False, "error": "hailo_mode_switch_failed", "switch": switch}), 503
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt or DEFAULT_AI_SERVICES[1]["description"]},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                    ],
+                }
+            ],
+        }
+        result = _vlm_caption_request(payload)
+        result["switch"] = switch
     return jsonify(result), (200 if result.get("ok") else 503)
 
 

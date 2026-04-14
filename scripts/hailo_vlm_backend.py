@@ -27,17 +27,17 @@ def _run_direct(payload: Dict[str, Any]) -> int:
 
     hef_path = resolve_hef_path(None, app_name=VLM_CHAT_APP, arch=HAILO10H_ARCH)
     if hef_path is None:
-        print(json.dumps({"error": "hef_not_found"}))
+        print(json.dumps({"ok": False, "error": "hef_not_found"}), flush=True)
         return 2
 
     image_path = str(payload.get("image_path") or "").strip()
     if not image_path:
-        print(json.dumps({"error": "missing_image_path"}))
+        print(json.dumps({"ok": False, "error": "missing_image_path"}), flush=True)
         return 2
 
     image = cv2.imread(image_path)
     if image is None:
-        print(json.dumps({"error": "image_load_failed", "image_path": image_path}))
+        print(json.dumps({"ok": False, "error": "image_load_failed", "image_path": image_path}), flush=True)
         return 2
 
     if len(image.shape) == 3 and image.shape[2] == 3:
@@ -64,13 +64,20 @@ def _run_direct(payload: Dict[str, Any]) -> int:
         },
     ]
 
-    params = VDevice.create_params()
-    params.group_id = SHARED_VDEVICE_GROUP_ID
-    vdevice = None
-    vlm = None
-    try:
+    global _DIRECT_CONTEXT
+    if _DIRECT_CONTEXT is None:
+        params = VDevice.create_params()
+        params.group_id = SHARED_VDEVICE_GROUP_ID
         vdevice = VDevice(params)
         vlm = VLM(vdevice, str(hef_path))
+        _DIRECT_CONTEXT = {"vdevice": vdevice, "vlm": vlm}
+    vdevice = _DIRECT_CONTEXT["vdevice"]
+    vlm = _DIRECT_CONTEXT["vlm"]
+    try:
+        try:
+            vlm.clear_context()
+        except Exception:
+            pass
         response = vlm.generate_all(
             prompt=prompt,
             frames=[image],
@@ -83,23 +90,99 @@ def _run_direct(payload: Dict[str, Any]) -> int:
             text = text.split("[{'type'")[0]
         if "<|im_end|>" in text:
             text = text.split("<|im_end|>")[0]
-        print(json.dumps({"text": text.strip()}))
+        try:
+            vlm.clear_context()
+        except Exception:
+            pass
+        print(json.dumps({"ok": True, "text": text.strip()}), flush=True)
         return 0
-    finally:
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}), flush=True)
+        return 1
+
+
+def _release_direct_context() -> None:
+    global _DIRECT_CONTEXT
+    if _DIRECT_CONTEXT is None:
+        return
+    vlm = _DIRECT_CONTEXT.get("vlm")
+    vdevice = _DIRECT_CONTEXT.get("vdevice")
+    try:
         if vlm:
-            try:
-                vlm.clear_context()
-                vlm.release()
-            except Exception:
-                pass
+            vlm.release()
+    except Exception:
+        pass
+    try:
         if vdevice:
-            try:
-                vdevice.release()
-            except Exception:
-                pass
+            vdevice.release()
+    except Exception:
+        pass
+    _DIRECT_CONTEXT = None
+
+
+def _serve_forever() -> int:
+    try:
+        for raw_line in sys.stdin:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            payload: Dict[str, Any] = json.loads(raw_line)
+            mode = (os.environ.get("HAILO_VLM_BACKEND_MODE") or "direct").strip().lower()
+            if mode == "direct":
+                rc = _run_direct(payload)
+                if rc != 0:
+                    # _run_direct already printed a JSON error line.
+                    continue
+            else:
+                template = (os.environ.get("HAILO_VLM_COMMAND_TEMPLATE") or "").strip()
+                if not template:
+                    print(json.dumps({"ok": False, "error": "missing_hailo_vlm_command_template"}), flush=True)
+                    continue
+                command = template.format(
+                    prompt=_quoted(payload.get("prompt")),
+                    image_path=_quoted(payload.get("image_path")),
+                    model=_quoted(payload.get("model")),
+                    max_tokens=_quoted(payload.get("max_tokens")),
+                    image_base64=_quoted(payload.get("image_base64")),
+                    image_mime_type=_quoted(payload.get("image_mime_type")),
+                )
+                app_dir = (os.environ.get("HAILO_VLM_APP_DIR") or "").strip() or None
+                proc = subprocess.run(
+                    ["sh", "-lc", command],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    cwd=app_dir,
+                )
+                stdout = (proc.stdout or "").strip()
+                if proc.returncode != 0:
+                    print(
+                        json.dumps({
+                            "ok": False,
+                            "error": "backend_failed",
+                            "returncode": proc.returncode,
+                            "stderr": (proc.stderr or "").strip(),
+                            "stdout": stdout,
+                        }),
+                        flush=True,
+                    )
+                    continue
+                try:
+                    parsed = json.loads(stdout)
+                except json.JSONDecodeError:
+                    parsed = {"ok": True, "text": stdout}
+                if "ok" not in parsed:
+                    parsed["ok"] = True
+                print(json.dumps(parsed), flush=True)
+    finally:
+        _release_direct_context()
+    return 0
 
 
 def main() -> int:
+    global _DIRECT_CONTEXT
+    if len(sys.argv) > 1 and sys.argv[1] == "--serve":
+        return _serve_forever()
     raw = sys.stdin.read()
     payload: Dict[str, Any] = json.loads(raw or "{}")
     mode = (os.environ.get("HAILO_VLM_BACKEND_MODE") or "direct").strip().lower()
@@ -130,6 +213,9 @@ def main() -> int:
     if proc.stderr:
         sys.stderr.write(proc.stderr)
     return proc.returncode
+
+
+_DIRECT_CONTEXT = None
 
 
 if __name__ == "__main__":

@@ -62,7 +62,9 @@
           <div class="col-12 col-lg-4">
             <label class="form-label" for="llmModel">Model</label>
             <select id="llmModel" class="form-select">
-              <option value="">Loading models...</option>
+              <option value="qwen2.5-instruct:1.5b">qwen2.5-instruct:1.5b</option>
+              <option value="qwen2:1.5b" selected>qwen2:1.5b</option>
+              <option value="llama3.2:3b">llama3.2:3b</option>
             </select>
           </div>
           <div class="col-12 col-lg-8">
@@ -86,7 +88,7 @@
           <div class="col-12 col-lg-3">
             <label class="form-label" for="vlmModel">Model</label>
             <select id="vlmModel" class="form-select">
-              <option value="">Loading models...</option>
+              <option value="local-vlm" selected>local-vlm</option>
             </select>
           </div>
           <div class="col-12 col-lg-3">
@@ -237,6 +239,23 @@
     return [];
   }
 
+  function pickPreferredModel(models, preferred) {
+    for (const candidate of preferred) {
+      if (models.includes(candidate)) return candidate;
+    }
+    return models[0] || '';
+  }
+
+  function formatVlmError(payload) {
+    const data = (payload && payload.response) || payload || {};
+    const stderr = String(data.stderr || '');
+    if (stderr.includes('HAILO_OUT_OF_PHYSICAL_DEVICES')) {
+      return 'Hailo device is busy. Stop `hailo-ollama` before running VLM, or switch back after VLM testing.';
+    }
+    if (typeof data.error === 'string' && data.error) return data.error;
+    return JSON.stringify(payload, null, 2);
+  }
+
   function stopCamera() {
     if (cameraStream) {
       cameraStream.getTracks().forEach((track) => track.stop());
@@ -260,7 +279,9 @@
     }
     const models = extractLlmModels(j);
     setModelOptions(llmModel, models);
-    if (llmModel && !llmModel.value && models[0]) llmModel.value = models[0];
+    if (llmModel && (!llmModel.value || !models.includes(llmModel.value))) {
+      llmModel.value = pickPreferredModel(models, ['qwen2.5-instruct:1.5b', 'qwen2:1.5b', 'llama3.2:3b']);
+    }
     showLlm(models.length ? `Loaded models: ${models.join(', ')}` : j);
   }
 
@@ -549,7 +570,7 @@
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j.ok) {
-        showVlm(j);
+        showVlm(`${formatVlmError(j)}${formatTiming(j)}`);
         return;
       }
       const content = (((j.response || {}).choices || [])[0] || {}).message?.content;
@@ -560,8 +581,6 @@
     }
   });
 
-  await refreshLlmModels();
-  await refreshVlmModels();
   await refreshServices();
   window.addEventListener('beforeunload', stopCamera);
 })();

@@ -1,9 +1,11 @@
 import base64
+import atexit
 import json
 import os
 import shlex
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -43,6 +45,7 @@ APP_HOST = (os.environ.get("VLM_SERVICE_HOST") or "0.0.0.0").strip() or "0.0.0.0
 APP_PORT = int((os.environ.get("VLM_SERVICE_PORT") or "8090").strip() or "8090")
 MODEL_ID = (os.environ.get("VLM_MODEL_ID") or "local-vlm").strip() or "local-vlm"
 BACKEND_CMD = (os.environ.get("VLM_BACKEND_CMD") or "").strip()
+BACKEND_PERSISTENT = (os.environ.get("VLM_BACKEND_PERSISTENT") or "1").strip().lower() not in {"0", "false", "no", "off"}
 DEFAULT_PROMPT = (
     os.environ.get("VLM_DEFAULT_PROMPT")
     or "Describe this image in a concise way and answer the user's question if one is provided."
@@ -144,6 +147,74 @@ def _materialize_temp_image(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], st
     return payload, temp_path
 
 
+class _BackendProcess:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen[str] | None = None
+
+    def _start(self) -> subprocess.Popen[str]:
+        if not BACKEND_CMD:
+            raise RuntimeError("backend_not_configured")
+        cmd = shlex.split(BACKEND_CMD)
+        if BACKEND_PERSISTENT:
+            cmd = [*cmd, "--serve"]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._proc = proc
+        return proc
+
+    def request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                proc = self._start()
+            if proc.stdin is None or proc.stdout is None:
+                raise RuntimeError("backend_pipes_unavailable")
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+            if not line:
+                stderr = ""
+                if proc.stderr is not None:
+                    try:
+                        stderr = proc.stderr.read()
+                    except Exception:
+                        stderr = ""
+                self._proc = None
+                raise RuntimeError(stderr.strip() or "backend_no_response")
+            return json.loads(line)
+
+    def close(self) -> None:
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+            if proc is None:
+                return
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+BACKEND_PROCESS = _BackendProcess()
+atexit.register(BACKEND_PROCESS.close)
+
+
 def _invoke_backend(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not BACKEND_CMD:
         return {
@@ -151,41 +222,14 @@ def _invoke_backend(payload: Dict[str, Any]) -> Dict[str, Any]:
             "error": "backend_not_configured",
             "message": "Set VLM_BACKEND_CMD to an executable that reads JSON on stdin and returns JSON or plain text on stdout.",
         }
-    cmd = shlex.split(BACKEND_CMD)
     temp_path = ""
     try:
         materialized_payload, temp_path = _materialize_temp_image(payload)
-        proc = subprocess.run(
-            cmd,
-            input=json.dumps(materialized_payload),
-            capture_output=True,
-            text=True,
-            timeout=BACKEND_TIMEOUT,
-            check=False,
-        )
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        if proc.returncode != 0:
-            return {
-                "ok": False,
-                "error": "backend_failed",
-                "returncode": proc.returncode,
-                "stderr": stderr,
-                "stdout": stdout,
-                "cmd": " ".join(shlex.quote(part) for part in cmd),
-            }
-        if not stdout:
-            return {"ok": False, "error": "backend_empty_output", "cmd": " ".join(shlex.quote(part) for part in cmd)}
-        try:
-            parsed = json.loads(stdout)
-            text = str(parsed.get("text") or parsed.get("output") or "").strip()
-            if text:
-                return {"ok": True, "text": text, "raw": parsed}
-        except json.JSONDecodeError:
-            pass
-        return {"ok": True, "text": stdout}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "backend_timeout", "timeout": BACKEND_TIMEOUT}
+        result = BACKEND_PROCESS.request(materialized_payload)
+        if not result.get("ok"):
+            return result
+        text = str(result.get("text") or result.get("output") or "").strip()
+        return {"ok": True, "text": text, "raw": result}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     finally:
