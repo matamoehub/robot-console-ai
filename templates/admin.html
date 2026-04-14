@@ -168,6 +168,12 @@
     vlmOut.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
   }
 
+  function formatTiming(result) {
+    const ms = Number(result && result.elapsed_ms);
+    if (!Number.isFinite(ms)) return '';
+    return `\n\nTiming: ${ms.toFixed(1)} ms`;
+  }
+
   function setModelOptions(select, models) {
     if (!select) return;
     select.innerHTML = '';
@@ -419,7 +425,8 @@
         showLlm(j);
         return;
       }
-      showLlm(extractLlmText(j) || j);
+      const text = extractLlmText(j) || JSON.stringify(j, null, 2);
+      showLlm(`${text}${formatTiming(j)}`);
     } finally {
       btnLlmAsk.disabled = false;
     }
@@ -532,7 +539,8 @@
         return;
       }
       const content = (((j.response || {}).choices || [])[0] || {}).message?.content;
-      showVlm(content || j);
+      const text = content || JSON.stringify(j, null, 2);
+      showVlm(`${text}${formatTiming(j)}`);
     } finally {
       btnVlmAsk.disabled = false;
     }

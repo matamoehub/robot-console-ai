@@ -3,6 +3,7 @@ import os
 import secrets
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -291,6 +292,7 @@ def _service_health(url: str) -> Dict[str, Any]:
 
 
 def _http_json_request(method: str, url: str, *, payload: Dict[str, Any] | None = None, timeout: float = 120.0) -> Dict[str, Any]:
+    started = time.perf_counter()
     try:
         import requests
 
@@ -304,10 +306,11 @@ def _http_json_request(method: str, url: str, *, payload: Dict[str, Any] | None 
             "ok": r.ok,
             "status_code": r.status_code,
             "url": url,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
             "response": data,
         }
     except Exception as exc:
-        return {"ok": False, "url": url, "error": str(exc)}
+        return {"ok": False, "url": url, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "error": str(exc)}
 
 
 def _hailo_ollama_models() -> Dict[str, Any]:
