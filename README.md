@@ -364,10 +364,15 @@ The backend substitutes:
 
 This is the seam intended for a future Hailo Whisper wrapper on the HQ Pi.
 
-For Hailo-10H speech recognition, prefer the more accurate `base` variant over `tiny.en` for robot voice commands:
+For Hailo-10H speech recognition, prefer the more accurate `base` variant over `tiny.en` for robot voice commands. The safest setup is to route command mode through the included wrapper script:
 
 ```bash
-STT_COMMAND_TEMPLATE='source /home/matamoe/hailo-apps/setup_env.sh >/dev/null 2>&1 && python3 /home/matamoe/hailo-apps/hailo_apps/python/standalone_apps/speech_recognition/speech_recognition.py --audio {audio_path} --arch hailo10h --variant base'
+HAILO_APPS_DIR=/home/matamoe/hailo-apps
+HAILO_STT_VARIANT=base
+HAILO_STT_ARCH=hailo10h
+STT_BACKEND_MODE=command
+STT_USES_HAILO=1
+STT_COMMAND_TEMPLATE='python3 /opt/robot/robot-console-ai/scripts/hailo_stt_wrapper.py --input {audio_path} --language {language}'
 ```
 
 ### Telegram bot
