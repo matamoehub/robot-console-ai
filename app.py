@@ -406,6 +406,28 @@ def _materialize_audio_payload(body: Dict[str, Any]) -> tuple[Optional[Path], Op
         return Path(handle.name), None
 
 
+def _normalize_audio_for_stt(audio_path: Path) -> tuple[Optional[Path], Optional[str], bool]:
+    suffix = audio_path.suffix.lower()
+    if suffix == ".wav":
+        return audio_path, None, False
+
+    ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(audio_path), "-ac", "1", "-ar", "16000", str(audio_path.with_suffix(".wav"))]
+    try:
+        proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=60.0, check=False)
+    except Exception as exc:
+        return None, f"audio_conversion_failed: {exc}", False
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if "No such file or directory" in stderr and "ffmpeg" in stderr:
+            return None, "ffmpeg_not_available", False
+        return None, f"audio_conversion_failed: {stderr or proc.stdout or 'ffmpeg_error'}", False
+
+    converted = audio_path.with_suffix(".wav")
+    if not converted.exists():
+        return None, "audio_conversion_failed: wav_not_created", False
+    return converted, None, True
+
+
 def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", mock_text: str = "") -> Dict[str, Any]:
     if not audio_path.exists():
         return {"ok": False, "error": "audio_path_not_found", "audio_path": str(audio_path)}
@@ -811,17 +833,29 @@ def _voice_command_from_request(
     preferred_robot_id = str(body.get("robot_id") or "").strip()
     use_llm = bool(body.get("use_llm", True))
     mock_text = str(body.get("mock_text") or "").strip()
+    normalized_audio_path: Optional[Path] = None
+    normalized_created = False
 
     try:
+        normalized_audio_path, normalize_error, normalized_created = _normalize_audio_for_stt(audio_path)
+        if normalize_error or normalized_audio_path is None:
+            result = {"ok": False, "error": normalize_error or "audio_normalization_failed", "sender": sender or {}}
+            _audit_robot_action("voice_command", result)
+            return result
         if STT_USES_HAILO:
             with HAILO_DEVICE_LOCK:
-                transcript = _stt_transcribe(audio_path, prompt=prompt, language=language, mock_text=mock_text)
+                transcript = _stt_transcribe(normalized_audio_path, prompt=prompt, language=language, mock_text=mock_text)
         else:
-            transcript = _stt_transcribe(audio_path, prompt=prompt, language=language, mock_text=mock_text)
+            transcript = _stt_transcribe(normalized_audio_path, prompt=prompt, language=language, mock_text=mock_text)
     finally:
         try:
             if audio_path.parent == Path(tempfile.gettempdir()):
                 audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            if normalized_created and normalized_audio_path and normalized_audio_path.parent == Path(tempfile.gettempdir()):
+                normalized_audio_path.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -1293,18 +1327,23 @@ def api_admin_stt_transcribe():
     audio_path, audio_error = _materialize_audio_payload(body)
     if audio_error or audio_path is None:
         return jsonify({"ok": False, "error": audio_error or "missing_audio_input"}), 400
+    normalized_audio_path: Optional[Path] = None
+    normalized_created = False
     try:
+        normalized_audio_path, normalize_error, normalized_created = _normalize_audio_for_stt(audio_path)
+        if normalize_error or normalized_audio_path is None:
+            return jsonify({"ok": False, "error": normalize_error or "audio_normalization_failed"}), 400
         if STT_USES_HAILO:
             with HAILO_DEVICE_LOCK:
                 result = _stt_transcribe(
-                    audio_path,
+                    normalized_audio_path,
                     prompt=str(body.get("prompt") or "").strip(),
                     language=str(body.get("language") or "").strip(),
                     mock_text=str(body.get("mock_text") or "").strip(),
                 )
         else:
             result = _stt_transcribe(
-                audio_path,
+                normalized_audio_path,
                 prompt=str(body.get("prompt") or "").strip(),
                 language=str(body.get("language") or "").strip(),
                 mock_text=str(body.get("mock_text") or "").strip(),
@@ -1313,6 +1352,11 @@ def api_admin_stt_transcribe():
         try:
             if audio_path.parent == Path(tempfile.gettempdir()):
                 audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            if normalized_created and normalized_audio_path and normalized_audio_path.parent == Path(tempfile.gettempdir()):
+                normalized_audio_path.unlink(missing_ok=True)
         except Exception:
             pass
     return jsonify(result), (200 if result.get("ok") else 503)
