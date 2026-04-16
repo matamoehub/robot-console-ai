@@ -1,4 +1,5 @@
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -28,6 +29,13 @@ from robot_brain import (
 APP_DIR = Path(__file__).resolve().parent
 APP = Flask(__name__, static_folder="static", template_folder="templates")
 APP.secret_key = os.environ.get("FLASK_SECRET", "robot-console-ai-local-only")
+LOG_LEVEL_NAME = (os.environ.get("ROBOT_CONSOLE_AI_LOG_LEVEL", "INFO").strip() or "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+LOGGER = logging.getLogger("robot-console-ai")
 
 
 def _load_env_file(path: Path) -> None:
@@ -409,27 +417,35 @@ def _materialize_audio_payload(body: Dict[str, Any]) -> tuple[Optional[Path], Op
 def _normalize_audio_for_stt(audio_path: Path) -> tuple[Optional[Path], Optional[str], bool]:
     suffix = audio_path.suffix.lower()
     if suffix == ".wav":
+        LOGGER.info("STT audio already wav path=%s", audio_path)
         return audio_path, None, False
 
     ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(audio_path), "-ac", "1", "-ar", "16000", str(audio_path.with_suffix(".wav"))]
+    LOGGER.info("Converting audio for STT input=%s output=%s", audio_path, audio_path.with_suffix(".wav"))
     try:
         proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=60.0, check=False)
     except Exception as exc:
+        LOGGER.exception("STT audio conversion exec failed input=%s", audio_path)
         return None, f"audio_conversion_failed: {exc}", False
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
         if "No such file or directory" in stderr and "ffmpeg" in stderr:
+            LOGGER.error("ffmpeg not available for STT conversion input=%s", audio_path)
             return None, "ffmpeg_not_available", False
+        LOGGER.error("STT audio conversion failed input=%s stderr=%s", audio_path, stderr or proc.stdout or "ffmpeg_error")
         return None, f"audio_conversion_failed: {stderr or proc.stdout or 'ffmpeg_error'}", False
 
     converted = audio_path.with_suffix(".wav")
     if not converted.exists():
+        LOGGER.error("STT audio conversion did not create wav input=%s output=%s", audio_path, converted)
         return None, "audio_conversion_failed: wav_not_created", False
+    LOGGER.info("STT audio conversion complete output=%s", converted)
     return converted, None, True
 
 
 def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", mock_text: str = "") -> Dict[str, Any]:
     if not audio_path.exists():
+        LOGGER.error("STT audio path not found path=%s", audio_path)
         return {"ok": False, "error": "audio_path_not_found", "audio_path": str(audio_path)}
 
     backend_cmd = STT_BACKEND_CMD
@@ -444,6 +460,7 @@ def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", m
         "mock_text": str(mock_text or "").strip(),
     }
     started = time.perf_counter()
+    LOGGER.info("Starting STT transcription backend_mode=%s audio_path=%s language=%s", STT_BACKEND_MODE, audio_path, payload["language"])
     try:
         proc = subprocess.run(
             shlex.split(backend_cmd),
@@ -466,6 +483,14 @@ def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", m
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
     if proc.returncode != 0:
+        LOGGER.error(
+            "STT backend failed returncode=%s elapsed_ms=%s cmd=%s stdout=%s stderr=%s",
+            proc.returncode,
+            elapsed_ms,
+            backend_cmd,
+            stdout,
+            stderr,
+        )
         return {
             "ok": False,
             "error": "stt_backend_failed",
@@ -490,8 +515,11 @@ def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", m
     if stderr:
         result["stderr"] = stderr
     if not result["text"]:
+        LOGGER.error("STT returned empty transcript elapsed_ms=%s cmd=%s stderr=%s stdout=%s", elapsed_ms, backend_cmd, stderr, stdout)
         result["ok"] = False
         result["error"] = str(parsed.get("error") or "empty_transcript")
+    else:
+        LOGGER.info("STT transcription complete elapsed_ms=%s text=%s", elapsed_ms, result["text"])
     return result
 
 
@@ -840,6 +868,7 @@ def _voice_command_from_request(
         normalized_audio_path, normalize_error, normalized_created = _normalize_audio_for_stt(audio_path)
         if normalize_error or normalized_audio_path is None:
             result = {"ok": False, "error": normalize_error or "audio_normalization_failed", "sender": sender or {}}
+            LOGGER.error("Voice command normalization failed error=%s", result["error"])
             _audit_robot_action("voice_command", result)
             return result
         if STT_USES_HAILO:
@@ -861,6 +890,7 @@ def _voice_command_from_request(
 
     if not transcript.get("ok"):
         result = {"ok": False, "error": "transcription_failed", "transcript": transcript, "sender": sender or {}}
+        LOGGER.error("Voice command transcription failed transcript=%s", transcript)
         _audit_robot_action("voice_command", result)
         return result
 
@@ -873,17 +903,20 @@ def _voice_command_from_request(
         "mode": "live" if execute_live else "test",
     }
     if not parsed.get("ok"):
+        LOGGER.error("Voice command parse failed transcript=%s parsed=%s", transcript.get("text"), parsed)
         _audit_robot_action("voice_command", result)
         return result
 
     if not execute_live:
         result["message"] = "Preview only. No robot command was executed."
+        LOGGER.info("Voice command preview transcript=%s target=%s", transcript.get("text"), parsed.get("target_robot_id"))
         _audit_robot_action("voice_command", result)
         return result
 
     execution = _execute_robot_intent(parsed)
     result["execution"] = execution
     result["ok"] = bool(execution.get("ok"))
+    LOGGER.info("Voice command live execution ok=%s transcript=%s", result["ok"], transcript.get("text"))
     _audit_robot_action("voice_command", result)
     return result
 

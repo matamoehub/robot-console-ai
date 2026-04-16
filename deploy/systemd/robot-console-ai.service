@@ -12,7 +12,8 @@ Environment=FLASK_RUN_PORT=8080
 ExecStart=/opt/robot/robot-console-ai/.venv/bin/flask run --host 0.0.0.0 --port 8080
 Restart=always
 RestartSec=2
-StandardOutput=file:/opt/robot/logs/robot-console-ai-stdout.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
