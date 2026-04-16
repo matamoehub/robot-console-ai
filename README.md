@@ -364,6 +364,12 @@ The backend substitutes:
 
 This is the seam intended for a future Hailo Whisper wrapper on the HQ Pi.
 
+For Hailo-10H speech recognition, prefer the more accurate `base` variant over `tiny.en` for robot voice commands:
+
+```bash
+STT_COMMAND_TEMPLATE='source /home/matamoe/hailo-apps/setup_env.sh >/dev/null 2>&1 && python3 /home/matamoe/hailo-apps/hailo_apps/python/standalone_apps/speech_recognition/speech_recognition.py --audio {audio_path} --arch hailo10h --variant base'
+```
+
 ### Telegram bot
 
 This repo also includes a simple Telegram polling bot:
