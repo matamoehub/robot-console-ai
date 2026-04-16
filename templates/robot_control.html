@@ -377,6 +377,8 @@
     }
     if (payload.parsed && payload.parsed.ok) {
       lines.push('');
+      lines.push(`Text sent to parser: ${JSON.stringify((payload.parsed.text || transcript.text || '').trim())}`);
+      lines.push('');
       lines.push(formatParseResult(payload.parsed));
     }
     if (payload.message) {
