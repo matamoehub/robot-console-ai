@@ -1,5 +1,6 @@
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -31,11 +32,15 @@ def main() -> int:
         return 1
 
     shell_cmd = (
-        f". {setup_script} >/dev/null 2>&1 && "
-        f"python3 {speech_script} --audio {Path(args.input).expanduser()} --arch {args.arch} --variant {args.variant}"
+        f"cd {shlex.quote(str(hailo_apps_dir))} && "
+        f". {shlex.quote(str(setup_script))} >/dev/null 2>&1 && "
+        f"python3 {shlex.quote(str(speech_script))} "
+        f"--audio {shlex.quote(str(Path(args.input).expanduser()))} "
+        f"--arch {shlex.quote(str(args.arch))} "
+        f"--variant {shlex.quote(str(args.variant))}"
     )
     proc = subprocess.run(
-        ["sh", "-lc", shell_cmd],
+        ["bash", "-lc", shell_cmd],
         capture_output=True,
         text=True,
         timeout=180,
