@@ -48,6 +48,28 @@ class RobotBrainParseTests(unittest.TestCase):
         self.assertEqual(result["steps"][0]["intent"]["action"], "camera_center")
         self.assertEqual(result["steps"][1]["intent"]["action"], "say")
 
+    def test_parse_multi_step_with_sentences_and_filler(self):
+        result = parse_text_command_plan(
+            "This is a test. Move forward for 2 seconds. Spin right and say hello.",
+            ROBOTS,
+            preferred_robot_id="Mata01",
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["multi_step"])
+        self.assertEqual(len(result["steps"]), 3)
+        self.assertEqual(result["steps"][0]["intent"]["action"], "catalog_only")
+        self.assertEqual(result["steps"][0]["intent"]["arguments"]["command"], "forward")
+        self.assertEqual(result["steps"][0]["intent"]["arguments"]["duration_s"], 2.0)
+        self.assertEqual(result["steps"][1]["intent"]["arguments"]["command"], "turn_right")
+        self.assertEqual(result["steps"][2]["intent"]["action"], "say")
+
+    def test_parse_then_split(self):
+        result = parse_text_command_plan("wave then say hello", ROBOTS, preferred_robot_id="Tony01")
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["steps"]), 2)
+        self.assertEqual(result["steps"][0]["intent"]["arguments"]["command"], "wave")
+        self.assertEqual(result["steps"][1]["intent"]["action"], "say")
+
 
 if __name__ == "__main__":
     unittest.main()

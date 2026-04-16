@@ -214,6 +214,14 @@ EXECUTABLE_ACTIONS = {
     "llm_service": {"label": "Toggle robot LLM service", "path": "/api/service/play_llm/{op}", "method": "POST"},
 }
 
+NON_COMMAND_PHRASES = (
+    "this is a test",
+    "robot console ai",
+    "testing",
+    "test message",
+    "hello test",
+)
+
 
 def normalize_robot_type(value: str) -> str:
     raw = str(value or "").strip().lower()
@@ -301,6 +309,23 @@ def _extract_say_text(text: str) -> Optional[str]:
         if match:
             return match.group(1).strip(" \"'")
     return None
+
+
+def _extract_duration_seconds(text: str) -> Optional[float]:
+    match = re.search(r"\bfor\s+(\d+(?:\.\d+)?)\s*(seconds?|secs?|s)\b", text, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except Exception:
+        return None
+
+
+def _is_non_command_phrase(text: str) -> bool:
+    lowered = str(text or "").strip().lower().strip(".!? ,;:")
+    if not lowered:
+        return True
+    return lowered in NON_COMMAND_PHRASES
 
 
 def parse_text_command(text: str, robots: List[Dict[str, Any]], preferred_robot_id: str = "") -> Dict[str, Any]:
@@ -395,7 +420,14 @@ def parse_text_command(text: str, robots: List[Dict[str, Any]], preferred_robot_
         result["intent"] = {"action": "camera_wiggle", "executable": True, "arguments": {"cycles": 2, "amplitude": 0.3, "speed_s": 0.2}, "summary": "Wiggle camera"}
         return result
 
+    move_duration = _extract_duration_seconds(raw_text)
     for phrase, family_command in (
+        ("spin left", "turn_left"),
+        ("spin right", "turn_right"),
+        ("move forward", "forward"),
+        ("move backward", "backward"),
+        ("walk forward", "walk_forward"),
+        ("walk backward", "walk_backward"),
         ("wave", "wave"),
         ("dance", "dance"),
         ("forward", "forward"),
@@ -405,11 +437,16 @@ def parse_text_command(text: str, robots: List[Dict[str, Any]], preferred_robot_
         ("pick up", "pick"),
     ):
         if phrase in lowered:
+            arguments: Dict[str, Any] = {"command": family_command}
+            summary = f"Recognized robot library command: {family_command}"
+            if move_duration is not None:
+                arguments["duration_s"] = move_duration
+                summary = f"{summary} for {move_duration:g} seconds"
             result["intent"] = {
                 "action": "catalog_only",
                 "executable": False,
-                "arguments": {"command": family_command},
-                "summary": f"Recognized robot library command: {family_command}",
+                "arguments": arguments,
+                "summary": summary,
             }
             return result
 
@@ -439,7 +476,11 @@ def parse_text_command_plan(text: str, robots: List[Dict[str, Any]], preferred_r
         return base
 
     raw_text = str(text or "").strip()
-    split_chunks = [chunk.strip() for chunk in re.split(r"\s+(?:and)\s+|,", raw_text) if chunk.strip()]
+    split_chunks = [
+        chunk.strip(" \t\r\n.;:!?")
+        for chunk in re.split(r"\s+(?:and|then)\s+|[,\n;]+|(?<=[.!?])\s+", raw_text)
+        if chunk.strip(" \t\r\n.;:!?")
+    ]
     if len(split_chunks) <= 1:
         base["steps"] = [
             _normalize_step_payload(
@@ -458,7 +499,20 @@ def parse_text_command_plan(text: str, robots: List[Dict[str, Any]], preferred_r
     steps: List[Dict[str, Any]] = []
     for chunk in split_chunks:
         step = parse_text_command(chunk, robots, preferred_robot_id=target_robot_id)
-        steps.append(_normalize_step_payload(step, target_scope, target_robot_id, mentioned_robot_ids, chunk))
+        normalized = _normalize_step_payload(step, target_scope, target_robot_id, mentioned_robot_ids, chunk)
+        steps.append(normalized)
+
+    recognized_steps = [step for step in steps if str((step.get("intent") or {}).get("action") or "") != "unknown"]
+    if recognized_steps and len(recognized_steps) != len(steps):
+        filtered_steps = []
+        for step in steps:
+            action = str((step.get("intent") or {}).get("action") or "")
+            if action != "unknown":
+                filtered_steps.append(step)
+                continue
+            if not _is_non_command_phrase(step.get("text") or ""):
+                filtered_steps.append(step)
+        steps = filtered_steps or recognized_steps
 
     first_step = steps[0] if steps else {}
     first_intent = first_step.get("intent") if isinstance(first_step.get("intent"), dict) else {}
