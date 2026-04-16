@@ -264,6 +264,7 @@ There is also a dedicated page for robot and Telegram testing:
 That page gives you:
 
 - direct robot-command testing
+- audio-file voice-command testing
 - Telegram message simulation
 - test mode preview without touching the robot
 - live mode execution against a connected robot
@@ -302,6 +303,7 @@ Then use:
 - `GET /api/brain/robots`
 - `POST /api/brain/parse`
 - `POST /api/brain/execute`
+- `POST /api/brain/voice/command`
 - `POST /api/brain/telegram/ingest`
 
 Example:
@@ -322,6 +324,45 @@ For the current system, the most reliable split is:
 - robot: execute the command through `robot_ops_web`
 
 That keeps the fragile robot-side speech path as thin as possible while using the HQ Pi for the heavier, easier-to-update intelligence layer.
+
+### Speech-to-text backend
+
+This repo now includes a pluggable HQ-side STT path:
+
+- admin test UI on `/admin/robot-control`
+- `POST /api/admin/stt/transcribe`
+- `POST /api/admin/voice/command`
+- `POST /api/brain/voice/command`
+
+Recommended env:
+
+```bash
+STT_BACKEND_CMD="python3 /opt/robot/robot-console-ai/scripts/stt_backend.py"
+STT_BACKEND_MODE=mock
+STT_DEFAULT_LANGUAGE=en
+STT_TRANSCRIBE_TIMEOUT=90
+STT_USES_HAILO=0
+```
+
+The bundled backend script supports two modes:
+
+- `mock`: returns a fake transcript so the whole HQ voice flow can be tested immediately
+- `command`: shells out to an external STT command and captures the transcript
+
+For `command` mode, set:
+
+```bash
+STT_BACKEND_MODE=command
+STT_COMMAND_TEMPLATE='your-stt-command --input {audio_path} --language {language}'
+```
+
+The backend substitutes:
+
+- `{audio_path}`
+- `{language}`
+- `{prompt}`
+
+This is the seam intended for a future Hailo Whisper wrapper on the HQ Pi.
 
 ### Telegram bot
 

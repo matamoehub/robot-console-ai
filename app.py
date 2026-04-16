@@ -1,8 +1,10 @@
 import json
+import mimetypes
 import os
 import secrets
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -77,6 +79,11 @@ HAILO_OLLAMA_SERVICE_NAME = os.environ.get("HAILO_OLLAMA_SERVICE", "hailo-ollama
 VLM_SERVICE_UNIT_NAME = os.environ.get("VLM_SERVICE_NAME", "vlm-service").strip() or "vlm-service"
 HAILO_OLLAMA_API_BASE_URL = os.environ.get("HAILO_OLLAMA_API_BASE_URL", "http://127.0.0.1:8000").strip() or "http://127.0.0.1:8000"
 VLM_API_BASE_URL = os.environ.get("VLM_API_BASE_URL", "http://127.0.0.1:8090").strip() or "http://127.0.0.1:8090"
+STT_BACKEND_CMD = (os.environ.get("STT_BACKEND_CMD") or "").strip()
+STT_BACKEND_MODE = (os.environ.get("STT_BACKEND_MODE", "mock").strip() or "mock").lower()
+STT_DEFAULT_LANGUAGE = (os.environ.get("STT_DEFAULT_LANGUAGE", "en").strip() or "en")
+STT_TRANSCRIBE_TIMEOUT = float(os.environ.get("STT_TRANSCRIBE_TIMEOUT", "90").strip() or "90")
+STT_USES_HAILO = (os.environ.get("STT_USES_HAILO", "0").strip() or "0").lower() in {"1", "true", "yes", "on"}
 ROBOT_REGISTRY_FILE = Path(
     os.environ.get("ROBOT_REGISTRY_FILE", "/opt/robot/robot-console/robots.json")
 ).expanduser()
@@ -348,6 +355,122 @@ def _http_json_request(method: str, url: str, *, payload: Dict[str, Any] | None 
         }
     except Exception as exc:
         return {"ok": False, "url": url, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "error": str(exc)}
+
+
+def _stt_extension_for_mime(mime_type: str) -> str:
+    lowered = str(mime_type or "").strip().lower()
+    if lowered == "audio/webm":
+        return ".webm"
+    if lowered in {"audio/wav", "audio/x-wav"}:
+        return ".wav"
+    if lowered == "audio/mp4":
+        return ".m4a"
+    if lowered == "audio/mpeg":
+        return ".mp3"
+    guessed = mimetypes.guess_extension(lowered or "audio/wav")
+    return guessed or ".wav"
+
+
+def _materialize_audio_payload(body: Dict[str, Any]) -> tuple[Optional[Path], Optional[str]]:
+    audio_path = str(body.get("audio_path") or "").strip()
+    if audio_path:
+        p = Path(audio_path).expanduser()
+        if not p.exists():
+            return None, "audio_path_not_found"
+        return p, None
+
+    audio_data_url = str(body.get("audio_data_url") or "").strip()
+    audio_base64 = str(body.get("audio_base64") or "").strip()
+    mime_type = str(body.get("audio_mime_type") or "").strip() or "audio/wav"
+    if audio_data_url:
+        if not audio_data_url.startswith("data:") or "," not in audio_data_url:
+            return None, "invalid_audio_data_url"
+        header, encoded = audio_data_url.split(",", 1)
+        header_mime = header[5:].split(";", 1)[0].strip()
+        if header_mime:
+            mime_type = header_mime
+        audio_base64 = encoded.strip()
+    if not audio_base64:
+        return None, "missing_audio_input"
+
+    try:
+        import base64
+
+        raw = base64.b64decode(audio_base64, validate=False)
+    except Exception:
+        return None, "invalid_audio_base64"
+
+    suffix = _stt_extension_for_mime(mime_type)
+    with tempfile.NamedTemporaryFile(prefix="robot-console-ai-audio-", suffix=suffix, delete=False) as handle:
+        handle.write(raw)
+        return Path(handle.name), None
+
+
+def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", mock_text: str = "") -> Dict[str, Any]:
+    if not audio_path.exists():
+        return {"ok": False, "error": "audio_path_not_found", "audio_path": str(audio_path)}
+
+    backend_cmd = STT_BACKEND_CMD
+    if not backend_cmd:
+        default_script = APP_DIR / "scripts" / "stt_backend.py"
+        backend_cmd = f"python3 {shlex.quote(str(default_script))}"
+
+    payload = {
+        "audio_path": str(audio_path),
+        "prompt": str(prompt or "").strip(),
+        "language": str(language or STT_DEFAULT_LANGUAGE or "").strip(),
+        "mock_text": str(mock_text or "").strip(),
+    }
+    started = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            shlex.split(backend_cmd),
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=STT_TRANSCRIBE_TIMEOUT,
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "stt_backend_exec_failed",
+            "cmd": backend_cmd,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            "detail": str(exc),
+        }
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "error": "stt_backend_failed",
+            "cmd": backend_cmd,
+            "returncode": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "elapsed_ms": elapsed_ms,
+        }
+    try:
+        parsed = json.loads(stdout) if stdout else {}
+    except Exception:
+        parsed = {"ok": True, "text": stdout}
+    result = {
+        "ok": bool(parsed.get("ok", True)),
+        "cmd": backend_cmd,
+        "elapsed_ms": elapsed_ms,
+        "text": str(parsed.get("text") or "").strip(),
+        "language": str(parsed.get("language") or payload["language"]).strip(),
+        "backend_mode": str(parsed.get("backend_mode") or STT_BACKEND_MODE).strip(),
+    }
+    if stderr:
+        result["stderr"] = stderr
+    if not result["text"]:
+        result["ok"] = False
+        result["error"] = str(parsed.get("error") or "empty_transcript")
+    return result
 
 
 def _audit_robot_action(event_type: str, payload: Dict[str, Any]) -> None:
@@ -673,6 +796,64 @@ def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: 
     return payload
 
 
+def _voice_command_from_request(
+    body: Dict[str, Any],
+    *,
+    execute_live: bool,
+    sender: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    audio_path, audio_error = _materialize_audio_payload(body)
+    if audio_error or audio_path is None:
+        return {"ok": False, "error": audio_error or "missing_audio_input"}
+
+    prompt = str(body.get("prompt") or "").strip()
+    language = str(body.get("language") or "").strip()
+    preferred_robot_id = str(body.get("robot_id") or "").strip()
+    use_llm = bool(body.get("use_llm", True))
+    mock_text = str(body.get("mock_text") or "").strip()
+
+    try:
+        if STT_USES_HAILO:
+            with HAILO_DEVICE_LOCK:
+                transcript = _stt_transcribe(audio_path, prompt=prompt, language=language, mock_text=mock_text)
+        else:
+            transcript = _stt_transcribe(audio_path, prompt=prompt, language=language, mock_text=mock_text)
+    finally:
+        try:
+            if audio_path.parent == Path(tempfile.gettempdir()):
+                audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not transcript.get("ok"):
+        result = {"ok": False, "error": "transcription_failed", "transcript": transcript, "sender": sender or {}}
+        _audit_robot_action("voice_command", result)
+        return result
+
+    parsed = _parse_robot_text_request(transcript.get("text") or "", preferred_robot_id=preferred_robot_id, use_llm=use_llm)
+    result: Dict[str, Any] = {
+        "ok": bool(parsed.get("ok")),
+        "sender": sender or {},
+        "transcript": transcript,
+        "parsed": parsed,
+        "mode": "live" if execute_live else "test",
+    }
+    if not parsed.get("ok"):
+        _audit_robot_action("voice_command", result)
+        return result
+
+    if not execute_live:
+        result["message"] = "Preview only. No robot command was executed."
+        _audit_robot_action("voice_command", result)
+        return result
+
+    execution = _execute_robot_intent(parsed)
+    result["execution"] = execution
+    result["ok"] = bool(execution.get("ok"))
+    _audit_robot_action("voice_command", result)
+    return result
+
+
 def _hailo_ollama_models() -> Dict[str, Any]:
     return _http_json_request("GET", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list", timeout=20.0)
 
@@ -963,6 +1144,10 @@ def api_admin_config():
             "robot_registry_file": str(ROBOT_REGISTRY_FILE),
             "robot_text_command_model": ROBOT_TEXT_COMMAND_MODEL,
             "robot_brain_api_token_configured": bool(ROBOT_BRAIN_API_TOKEN),
+            "stt_backend_cmd": STT_BACKEND_CMD,
+            "stt_backend_mode": STT_BACKEND_MODE,
+            "stt_default_language": STT_DEFAULT_LANGUAGE,
+            "stt_uses_hailo": STT_USES_HAILO,
             "hailo_mode": _hailo_mode_status(),
             "services": AI_SERVICES,
         }
@@ -1101,6 +1286,48 @@ def api_admin_robot_control_execute():
     return jsonify(result), (200 if result.get("ok") else 503)
 
 
+@APP.post("/api/admin/stt/transcribe")
+@need_login
+def api_admin_stt_transcribe():
+    body = request.get_json(silent=True) or {}
+    audio_path, audio_error = _materialize_audio_payload(body)
+    if audio_error or audio_path is None:
+        return jsonify({"ok": False, "error": audio_error or "missing_audio_input"}), 400
+    try:
+        if STT_USES_HAILO:
+            with HAILO_DEVICE_LOCK:
+                result = _stt_transcribe(
+                    audio_path,
+                    prompt=str(body.get("prompt") or "").strip(),
+                    language=str(body.get("language") or "").strip(),
+                    mock_text=str(body.get("mock_text") or "").strip(),
+                )
+        else:
+            result = _stt_transcribe(
+                audio_path,
+                prompt=str(body.get("prompt") or "").strip(),
+                language=str(body.get("language") or "").strip(),
+                mock_text=str(body.get("mock_text") or "").strip(),
+            )
+    finally:
+        try:
+            if audio_path.parent == Path(tempfile.gettempdir()):
+                audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/admin/voice/command")
+@need_login
+def api_admin_voice_command():
+    body = request.get_json(silent=True) or {}
+    execute_live = bool(body.get("execute_live"))
+    result = _voice_command_from_request(body, execute_live=execute_live, sender={"source": "admin-voice"})
+    status = 200 if result.get("ok") else 503 if execute_live else 400
+    return jsonify(result), status
+
+
 @APP.post("/api/admin/telegram/dispatch")
 @need_login
 def api_admin_telegram_dispatch():
@@ -1159,6 +1386,24 @@ def api_brain_execute():
         return jsonify(parsed), 400
     result = _execute_robot_intent(parsed)
     return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/brain/voice/command")
+def api_brain_voice_command():
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "invalid_api_token"}), 401
+    body = request.get_json(silent=True) or {}
+    result = _voice_command_from_request(
+        body,
+        execute_live=bool(body.get("execute_live")),
+        sender={
+            "source": "api-voice",
+            "device_id": str(body.get("device_id") or "").strip(),
+            "display_name": str(body.get("display_name") or "").strip(),
+        },
+    )
+    status = 200 if result.get("ok") else 503 if bool(body.get("execute_live")) else 400
+    return jsonify(result), status
 
 
 @APP.post("/api/brain/telegram/ingest")

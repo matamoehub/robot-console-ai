@@ -57,6 +57,53 @@
     <div class="card">
       <div class="card-body">
         <div class="d-flex justify-content-between align-items-center mb-3">
+          <div class="fw-semibold">Voice Command Test</div>
+          <span class="badge text-bg-secondary">Audio file -> STT -> robot brain</span>
+        </div>
+        <div class="row g-3">
+          <div class="col-12 col-lg-2">
+            <label class="form-label" for="voiceRobot">Robot</label>
+            <select id="voiceRobot" class="form-select"></select>
+          </div>
+          <div class="col-12 col-lg-3">
+            <label class="form-label" for="voiceAudioFile">Audio file</label>
+            <input id="voiceAudioFile" class="form-control" type="file" accept="audio/*">
+            <div class="mt-2 d-flex gap-2 flex-wrap">
+              <button id="btnVoiceRecordStart" class="btn btn-outline-primary btn-sm" type="button">Start Recording</button>
+              <button id="btnVoiceRecordStop" class="btn btn-outline-secondary btn-sm" type="button" disabled>Stop</button>
+            </div>
+            <div id="voiceRecordStatus" class="small text-muted mt-2">No recording yet.</div>
+          </div>
+          <div class="col-12 col-lg-2">
+            <label class="form-label" for="voiceLanguage">Language</label>
+            <input id="voiceLanguage" class="form-control" type="text" value="en" placeholder="en">
+          </div>
+          <div class="col-12 col-lg-3">
+            <label class="form-label" for="voicePrompt">STT hint</label>
+            <input id="voicePrompt" class="form-control" type="text" placeholder="Optional transcription hint">
+          </div>
+          <div class="col-12 col-lg-2">
+            <label class="form-label" for="voiceUseLlm">Parser</label>
+            <div class="form-check">
+              <input id="voiceUseLlm" class="form-check-input" type="checkbox" checked>
+              <label class="form-check-label" for="voiceUseLlm">Use LLM</label>
+            </div>
+          </div>
+        </div>
+        <div class="mt-3 d-flex gap-2 flex-wrap">
+          <button id="btnVoiceTranscribe" class="btn btn-outline-primary btn-sm" type="button">Transcribe Only</button>
+          <button id="btnVoiceTest" class="btn btn-outline-secondary btn-sm" type="button">Transcribe + Parse</button>
+          <button id="btnVoiceLive" class="btn btn-warning btn-sm" type="button">Transcribe + Execute</button>
+        </div>
+        <pre id="voiceOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap;">(no voice test yet)</pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-3">
           <div class="fw-semibold">Telegram Relay Simulator</div>
           <span class="badge text-bg-dark">Preview or live through the same ingest path</span>
         </div>
@@ -106,15 +153,32 @@
   const telegramName = document.getElementById('telegramName');
   const telegramText = document.getElementById('telegramText');
   const telegramOut = document.getElementById('telegramOut');
+  const voiceRobot = document.getElementById('voiceRobot');
+  const voiceAudioFile = document.getElementById('voiceAudioFile');
+  const voiceLanguage = document.getElementById('voiceLanguage');
+  const voicePrompt = document.getElementById('voicePrompt');
+  const voiceUseLlm = document.getElementById('voiceUseLlm');
+  const voiceOut = document.getElementById('voiceOut');
+  const voiceRecordStatus = document.getElementById('voiceRecordStatus');
   const btnRefreshRobots = document.getElementById('btnRefreshRobots');
   const btnRefreshMode = document.getElementById('btnRefreshMode');
   const btnDirectParse = document.getElementById('btnDirectParse');
   const btnDirectExecute = document.getElementById('btnDirectExecute');
   const btnTelegramTest = document.getElementById('btnTelegramTest');
   const btnTelegramLive = document.getElementById('btnTelegramLive');
+  const btnVoiceTranscribe = document.getElementById('btnVoiceTranscribe');
+  const btnVoiceTest = document.getElementById('btnVoiceTest');
+  const btnVoiceLive = document.getElementById('btnVoiceLive');
+  const btnVoiceRecordStart = document.getElementById('btnVoiceRecordStart');
+  const btnVoiceRecordStop = document.getElementById('btnVoiceRecordStop');
   let lastParsed = null;
   let robotCatalog = {};
   let robotIndex = {};
+  let voiceRecorder = null;
+  let voiceRecorderStream = null;
+  let voiceRecorderChunks = [];
+  let recordedAudioDataUrl = '';
+  let recordedAudioMimeType = 'audio/webm';
 
   function show(el, value) {
     if (!el) return;
@@ -294,6 +358,123 @@
     return lines.join('\n');
   }
 
+  function formatVoiceResult(payload) {
+    if (!payload || typeof payload !== 'object') return String(payload || '');
+    const lines = [];
+    lines.push(`Mode: ${payload.mode || 'transcribe'}`);
+    const transcript = payload.transcript || payload;
+    if (transcript.text) {
+      lines.push(`Transcript: ${transcript.text}`);
+    }
+    if (transcript.language) {
+      lines.push(`Language: ${transcript.language}`);
+    }
+    if (typeof transcript.elapsed_ms === 'number') {
+      lines.push(`STT timing: ${transcript.elapsed_ms} ms`);
+    }
+    if (transcript.backend_mode) {
+      lines.push(`STT backend: ${transcript.backend_mode}`);
+    }
+    if (payload.parsed && payload.parsed.ok) {
+      lines.push('');
+      lines.push(formatParseResult(payload.parsed));
+    }
+    if (payload.message) {
+      lines.push('');
+      lines.push(payload.message);
+    }
+    if (payload.execution) {
+      lines.push('');
+      lines.push(formatExecutionResult(payload.execution));
+    }
+    if (!payload.ok && payload.error) {
+      lines.push('');
+      lines.push(`Error: ${payload.error}`);
+    }
+    return lines.join('\n');
+  }
+
+  async function fileToDataUrl(file) {
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('file_read_failed'));
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function setVoiceRecordStatus(text) {
+    if (voiceRecordStatus) voiceRecordStatus.textContent = text;
+  }
+
+  function clearRecordedAudio() {
+    recordedAudioDataUrl = '';
+    recordedAudioMimeType = 'audio/webm';
+  }
+
+  function stopVoiceRecorderTracks() {
+    if (voiceRecorderStream) {
+      voiceRecorderStream.getTracks().forEach((track) => track.stop());
+      voiceRecorderStream = null;
+    }
+  }
+
+  async function startVoiceRecording() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setVoiceRecordStatus('Browser recording is not supported here.');
+      return;
+    }
+    clearRecordedAudio();
+    try {
+      voiceRecorderStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const preferredTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+      let selectedType = '';
+      preferredTypes.forEach((candidate) => {
+        if (!selectedType && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidate)) {
+          selectedType = candidate;
+        }
+      });
+      voiceRecorder = selectedType ? new MediaRecorder(voiceRecorderStream, { mimeType: selectedType }) : new MediaRecorder(voiceRecorderStream);
+      voiceRecorderChunks = [];
+      voiceRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          voiceRecorderChunks.push(event.data);
+        }
+      };
+      voiceRecorder.onstop = async () => {
+        const blob = new Blob(voiceRecorderChunks, { type: voiceRecorder.mimeType || selectedType || 'audio/webm' });
+        recordedAudioMimeType = blob.type || 'audio/webm';
+        recordedAudioDataUrl = await fileToDataUrl(blob);
+        setVoiceRecordStatus(`Recorded snippet ready (${Math.round(blob.size / 1024)} KB).`);
+        btnVoiceRecordStart.disabled = false;
+        btnVoiceRecordStop.disabled = true;
+        stopVoiceRecorderTracks();
+      };
+      voiceRecorder.onerror = () => {
+        setVoiceRecordStatus('Recording failed.');
+        btnVoiceRecordStart.disabled = false;
+        btnVoiceRecordStop.disabled = true;
+        stopVoiceRecorderTracks();
+      };
+      voiceRecorder.start();
+      setVoiceRecordStatus('Recording… click Stop when ready.');
+      btnVoiceRecordStart.disabled = true;
+      btnVoiceRecordStop.disabled = false;
+    } catch (error) {
+      setVoiceRecordStatus(`Microphone access failed: ${error.message || error}`);
+      btnVoiceRecordStart.disabled = false;
+      btnVoiceRecordStop.disabled = true;
+      stopVoiceRecorderTracks();
+    }
+  }
+
+  function stopVoiceRecording() {
+    if (voiceRecorder && voiceRecorder.state !== 'inactive') {
+      voiceRecorder.stop();
+      setVoiceRecordStatus('Finishing recording…');
+    }
+  }
+
   function setRobotOptions(select, robots) {
     if (!select) return;
     const previous = select.value || '';
@@ -360,6 +541,7 @@
     });
     setRobotOptions(directRobot, j.robots || []);
     setRobotOptions(telegramRobot, j.robots || []);
+    setRobotOptions(voiceRobot, j.robots || []);
     const summary = (j.robots || []).map((robot) => {
       const mode = (((robot.master_mode_status || {}).response || {}).current_mode || {}).mode || 'unknown';
       return `${robot.id} (${robot.catalog_label || robot.type || 'Robot'}) mode=${mode}`;
@@ -437,12 +619,74 @@
     show(telegramOut, formatTelegramResult(j));
   }
 
+  async function voiceDispatch(kind) {
+    const file = voiceAudioFile?.files?.[0];
+    let audioDataUrl = '';
+    let audioMimeType = '';
+    if (file) {
+      show(voiceOut, 'Preparing audio...');
+      audioDataUrl = await fileToDataUrl(file);
+      audioMimeType = file.type || 'audio/wav';
+    } else if (recordedAudioDataUrl) {
+      show(voiceOut, 'Using recorded snippet...');
+      audioDataUrl = recordedAudioDataUrl;
+      audioMimeType = recordedAudioMimeType || 'audio/webm';
+    } else {
+      show(voiceOut, 'Choose an audio file or record a snippet first.');
+      return;
+    }
+    if (kind === 'transcribe') {
+      const r = await fetch('/api/admin/stt/transcribe', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audio_data_url: audioDataUrl,
+          audio_mime_type: audioMimeType,
+          language: (voiceLanguage.value || '').trim(),
+          prompt: (voicePrompt.value || '').trim(),
+        })
+      });
+      const j = await r.json().catch(() => ({}));
+      show(voiceOut, formatVoiceResult(j));
+      return;
+    }
+
+    const r = await fetch('/api/admin/voice/command', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        audio_data_url: audioDataUrl,
+        audio_mime_type: audioMimeType,
+        language: (voiceLanguage.value || '').trim(),
+        prompt: (voicePrompt.value || '').trim(),
+        robot_id: (voiceRobot.value || '').trim(),
+        use_llm: !!voiceUseLlm.checked,
+        execute_live: kind === 'live',
+      })
+    });
+    const j = await r.json().catch(() => ({}));
+    show(voiceOut, formatVoiceResult(j));
+  }
+
   btnRefreshRobots?.addEventListener('click', refreshRobots);
   btnRefreshMode?.addEventListener('click', refreshMode);
   btnDirectParse?.addEventListener('click', directParse);
   btnDirectExecute?.addEventListener('click', directExecute);
   btnTelegramTest?.addEventListener('click', () => telegramDispatch('test'));
   btnTelegramLive?.addEventListener('click', () => telegramDispatch('live'));
+  btnVoiceTranscribe?.addEventListener('click', () => voiceDispatch('transcribe'));
+  btnVoiceTest?.addEventListener('click', () => voiceDispatch('test'));
+  btnVoiceLive?.addEventListener('click', () => voiceDispatch('live'));
+  btnVoiceRecordStart?.addEventListener('click', startVoiceRecording);
+  btnVoiceRecordStop?.addEventListener('click', stopVoiceRecording);
+  voiceAudioFile?.addEventListener('change', () => {
+    if (voiceAudioFile.files && voiceAudioFile.files.length) {
+      clearRecordedAudio();
+      setVoiceRecordStatus(`Using uploaded file: ${voiceAudioFile.files[0].name}`);
+    }
+  });
   telegramMode?.addEventListener('change', () => {
     if (telegramMode.value === 'live') {
       btnTelegramLive?.classList.remove('btn-danger');
