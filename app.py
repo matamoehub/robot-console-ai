@@ -1021,6 +1021,18 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
             result = _robot_request(robot, "POST", f"/api/service/play_llm/{op}", {}, timeout=20.0)
             if not result.get("ok"):
                 result = _robot_request(robot, "POST", f"/api/service/ros_llm/{op}", {}, timeout=20.0)
+        elif action == "catalog_only":
+            remote_text = str(parsed.get("text") or "").strip()
+            if not remote_text:
+                remote_text = str(args.get("command") or "").strip()
+            if not remote_text:
+                result = {"ok": False, "robot_id": robot.get("id"), "error": "missing_catalog_command_text"}
+            else:
+                result = _robot_remote_text_command(
+                    robot,
+                    remote_text,
+                    sender={"source": "robot-console-ai"},
+                )
         else:
             result = {"ok": False, "error": "unsupported_action", "action": action}
         results.append(result)

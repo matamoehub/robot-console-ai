@@ -212,6 +212,7 @@ EXECUTABLE_ACTIONS = {
     "camera_shake": {"label": "Shake camera", "path": "/api/camera/shake", "method": "POST"},
     "camera_wiggle": {"label": "Wiggle camera", "path": "/api/camera/wiggle", "method": "POST"},
     "llm_service": {"label": "Toggle robot LLM service", "path": "/api/service/play_llm/{op}", "method": "POST"},
+    "catalog_only": {"label": "Robot library command", "path": "/api/remote/control", "method": "POST"},
 }
 
 NON_COMMAND_PHRASES = (
@@ -426,6 +427,51 @@ def parse_text_command(text: str, robots: List[Dict[str, Any]], preferred_robot_
     if "wiggle camera" in lowered or "camera wiggle" in lowered:
         result["intent"] = {"action": "camera_wiggle", "executable": True, "arguments": {"cycles": 2, "amplitude": 0.3, "speed_s": 0.2}, "summary": "Wiggle camera"}
         return result
+
+    eye_color = None
+    for color_name in ("red", "green", "blue", "yellow", "purple", "pink", "orange", "white", "cyan", "teal"):
+        if re.search(rf"\b{color_name}\b", lowered):
+            eye_color = color_name
+            break
+    if "eye" in lowered or "eyes" in lowered:
+        eye_command = ""
+        eye_summary_target = "both eyes"
+        if "left eye" in lowered:
+            eye_command = "set_left"
+            eye_summary_target = "left eye"
+        elif "right eye" in lowered:
+            eye_command = "set_right"
+            eye_summary_target = "right eye"
+        elif eye_color:
+            eye_command = "set_both"
+        elif "eyes off" in lowered or "turn eyes off" in lowered:
+            eye_command = "off"
+            eye_summary_target = "eyes"
+        elif "blink" in lowered:
+            eye_command = "blink"
+            eye_summary_target = "eyes"
+        elif "wink" in lowered:
+            eye_command = "wink"
+            eye_summary_target = "eyes"
+        if eye_command:
+            arguments = {"command": eye_command}
+            summary = f"Robot eye command: {eye_command}"
+            if eye_color:
+                arguments["color"] = eye_color
+                summary = f"Set {eye_summary_target} to {eye_color}"
+            elif eye_command == "off":
+                summary = "Turn eyes off"
+            elif eye_command == "blink":
+                summary = "Blink eyes"
+            elif eye_command == "wink":
+                summary = "Wink"
+            result["intent"] = {
+                "action": "catalog_only",
+                "executable": True,
+                "arguments": arguments,
+                "summary": summary,
+            }
+            return result
 
     move_duration = _extract_duration_seconds(raw_text)
     for phrase, family_command in (
