@@ -731,6 +731,13 @@ def _audit_robot_action(event_type: str, payload: Dict[str, Any]) -> None:
         pass
 
 
+def _public_robot_response(payload: Dict[str, Any]) -> Dict[str, Any]:
+    compact = _compact_audit_value(payload)
+    if isinstance(compact, dict):
+        return compact
+    return {"ok": bool(payload.get("ok")), "value": compact}
+
+
 def _api_token_ok(req) -> bool:
     expected = (ROBOT_BRAIN_API_TOKEN or "").strip()
     if not expected:
@@ -1667,7 +1674,7 @@ def api_admin_robot_control_parse():
     preferred_robot_id = str(body.get("robot_id") or "").strip()
     use_llm = bool(body.get("use_llm", True))
     result = _parse_robot_text_request(text, preferred_robot_id=preferred_robot_id, use_llm=use_llm)
-    return jsonify(result), (200 if result.get("ok") else 400)
+    return jsonify(_public_robot_response(result)), (200 if result.get("ok") else 400)
 
 
 @APP.post("/api/admin/robot-control/execute")
@@ -1681,9 +1688,9 @@ def api_admin_robot_control_execute():
         use_llm = bool(body.get("use_llm", True))
         parsed = _parse_robot_text_request(text, preferred_robot_id=preferred_robot_id, use_llm=use_llm)
         if not parsed.get("ok"):
-            return jsonify(parsed), 400
+            return jsonify(_public_robot_response(parsed)), 400
     result = _execute_robot_intent(parsed)
-    return jsonify(result), (200 if result.get("ok") else 503)
+    return jsonify(_public_robot_response(result)), (200 if result.get("ok") else 503)
 
 
 @APP.post("/api/admin/stt/transcribe")
@@ -1777,7 +1784,7 @@ def api_brain_parse():
         preferred_robot_id=str(body.get("robot_id") or "").strip(),
         use_llm=bool(body.get("use_llm", True)),
     )
-    return jsonify(result), (200 if result.get("ok") else 400)
+    return jsonify(_public_robot_response(result)), (200 if result.get("ok") else 400)
 
 
 @APP.post("/api/brain/execute")
@@ -1793,9 +1800,9 @@ def api_brain_execute():
             use_llm=bool(body.get("use_llm", True)),
         )
     if not parsed.get("ok"):
-        return jsonify(parsed), 400
+        return jsonify(_public_robot_response(parsed)), 400
     result = _execute_robot_intent(parsed)
-    return jsonify(result), (200 if result.get("ok") else 503)
+    return jsonify(_public_robot_response(result)), (200 if result.get("ok") else 503)
 
 
 @APP.post("/api/brain/voice/command")
@@ -1813,7 +1820,7 @@ def api_brain_voice_command():
         },
     )
     status = 200 if result.get("ok") else 503 if bool(body.get("execute_live")) else 400
-    return jsonify(result), status
+    return jsonify(_public_robot_response(result)), status
 
 
 @APP.post("/api/brain/telegram/ingest")
@@ -1832,7 +1839,7 @@ def api_brain_telegram_ingest():
             "username": str(body.get("username") or "").strip(),
         },
     )
-    return jsonify(result), (200 if result.get("ok") else 503 if str(result.get("mode") or "") == "live" else 400)
+    return jsonify(_public_robot_response(result)), (200 if result.get("ok") else 503 if str(result.get("mode") or "") == "live" else 400)
 
 
 @APP.post("/api/brain/slack/events")
