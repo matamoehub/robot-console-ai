@@ -958,14 +958,35 @@ def _format_slack_result(result: Dict[str, Any]) -> str:
 def _process_slack_event(event: Dict[str, Any]) -> None:
     event_type = str(event.get("type") or "").strip()
     if event_type not in {"message", "app_mention"}:
+        LOGGER.info("Slack event ignored reason=unsupported_event_type event_type=%s event=%s", event_type, event)
         return
-    if event.get("bot_id") or event.get("subtype"):
+    if event.get("bot_id"):
+        LOGGER.info("Slack event ignored reason=bot_message event_type=%s channel=%s", event_type, str(event.get("channel") or "").strip())
+        return
+    subtype = str(event.get("subtype") or "").strip()
+    if subtype:
+        LOGGER.info(
+            "Slack event ignored reason=subtype event_type=%s subtype=%s channel=%s",
+            event_type,
+            subtype,
+            str(event.get("channel") or "").strip(),
+        )
         return
     channel_id = str(event.get("channel") or "").strip()
-    if not channel_id or not _slack_allowed_channel(channel_id):
+    if not channel_id:
+        LOGGER.info("Slack event ignored reason=missing_channel event_type=%s event=%s", event_type, event)
+        return
+    if not _slack_allowed_channel(channel_id):
+        LOGGER.info(
+            "Slack event ignored reason=channel_not_allowed event_type=%s channel=%s allowed_channels=%s",
+            event_type,
+            channel_id,
+            sorted(SLACK_ALLOWED_CHANNEL_IDS),
+        )
         return
     text = _slack_clean_text(str(event.get("text") or ""))
     if not text:
+        LOGGER.info("Slack event ignored reason=empty_text event_type=%s channel=%s raw_text=%s", event_type, channel_id, str(event.get("text") or ""))
         return
     sender = {
         "source": "slack",
@@ -973,6 +994,14 @@ def _process_slack_event(event: Dict[str, Any]) -> None:
         "user_id": str(event.get("user") or "").strip(),
         "thread_ts": str(event.get("thread_ts") or event.get("ts") or "").strip(),
     }
+    LOGGER.info(
+        "Slack event accepted event_type=%s channel=%s user=%s thread_ts=%s text=%s",
+        event_type,
+        channel_id,
+        sender["user_id"],
+        sender["thread_ts"],
+        text,
+    )
     result = _slack_ingest(
         text,
         robot_id=SLACK_DEFAULT_ROBOT_ID,
@@ -990,6 +1019,8 @@ def _process_slack_event(event: Dict[str, Any]) -> None:
             "unfurl_media": False,
         },
     )
+    if post_result.get("ok"):
+        LOGGER.info("Slack reply posted channel=%s thread_ts=%s", channel_id, sender["thread_ts"])
     if not post_result.get("ok"):
         LOGGER.error("Slack reply failed channel=%s result=%s", channel_id, post_result)
 
