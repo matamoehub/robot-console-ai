@@ -678,6 +678,26 @@ def _robot_master_mode_status(robot: Dict[str, Any]) -> Dict[str, Any]:
     return _robot_request(robot, "GET", "/api/admin/master-mode/status", timeout=10.0)
 
 
+def _ensure_robot_remote_mode(robot: Dict[str, Any]) -> Dict[str, Any]:
+    return _robot_request(
+        robot,
+        "POST",
+        "/api/admin/master-mode/activate",
+        {"mode": "llm_remote"},
+        timeout=20.0,
+    )
+
+
+def _robot_remote_text_command(robot: Dict[str, Any], text: str, sender: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
+        "text": str(text or "").strip(),
+        "source": str((sender or {}).get("source") or "robot-console-ai"),
+        "user_id": str((sender or {}).get("user_id") or "").strip() or None,
+        "channel_id": str((sender or {}).get("channel_id") or "").strip() or None,
+    }
+    return _robot_request(robot, "POST", "/api/remote/control", payload, timeout=20.0)
+
+
 def _parse_robot_text_with_llm(text: str, robots: List[Dict[str, Any]], preferred_robot_id: str = "") -> Dict[str, Any]:
     prompt = build_llm_parser_prompt(text, robots, preferred_robot_id=preferred_robot_id)
     llm_res = _hailo_ollama_chat(ROBOT_TEXT_COMMAND_MODEL, prompt, options={"num_predict": 192})
@@ -809,8 +829,8 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
             preview_path = ""
             preview_method = "POST"
             if action == "say":
-                preview_path = "/api/cmd/say"
-                preview_payload = {"text": str(args.get("text") or "").strip()}
+                preview_path = "/api/remote/control"
+                preview_payload = {"text": f'say {str(args.get("text") or "").strip()}', "source": "robot-console-ai"}
             elif action == "soundoff":
                 preview_path = "/api/cmd/soundoff"
                 preview_payload = {}
@@ -854,7 +874,20 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         if action == "say":
-            result = _robot_request(robot, "POST", "/api/cmd/say", {"text": str(args.get("text") or "").strip()}, timeout=20.0)
+            mode_res = _ensure_robot_remote_mode(robot)
+            if not mode_res.get("ok"):
+                result = {
+                    "ok": False,
+                    "robot_id": robot.get("id"),
+                    "error": "failed_to_enable_llm_remote",
+                    "mode_result": mode_res,
+                }
+            else:
+                result = _robot_remote_text_command(
+                    robot,
+                    f'say {str(args.get("text") or "").strip()}',
+                    sender={"source": "robot-console-ai"},
+                )
         elif action == "soundoff":
             result = _robot_request(robot, "POST", "/api/cmd/soundoff", {}, timeout=15.0)
         elif action == "allstop":
@@ -939,7 +972,21 @@ def _slack_ingest(text: str, robot_id: str = "", mode: str = "test", sender: Opt
 def _format_slack_result(result: Dict[str, Any]) -> str:
     if not result.get("ok"):
         parsed = result.get("parsed") if isinstance(result.get("parsed"), dict) else {}
-        error = str(result.get("error") or parsed.get("error") or "command_failed")
+        execution = result.get("execution") if isinstance(result.get("execution"), dict) else {}
+        user_message = ""
+        for item in execution.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            response = item.get("response") if isinstance(item.get("response"), dict) else {}
+            if response.get("user_message"):
+                user_message = str(response.get("user_message") or "").strip()
+                break
+            mode_result = item.get("mode_result") if isinstance(item.get("mode_result"), dict) else {}
+            mode_response = mode_result.get("response") if isinstance(mode_result.get("response"), dict) else {}
+            if mode_response.get("user_message"):
+                user_message = str(mode_response.get("user_message") or "").strip()
+                break
+        error = user_message or str(result.get("error") or parsed.get("error") or "command_failed")
         return f"Robot command failed: {error}"
     preview = result.get("preview") if isinstance(result.get("preview"), dict) else {}
     parsed = result.get("parsed") if isinstance(result.get("parsed"), dict) else {}

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from unittest import mock
 
+import app
 from app import APP
 
 
@@ -119,6 +120,40 @@ class AiServiceAppTest(unittest.TestCase):
         self.assertEqual(target.__name__, "_process_slack_event")
         self.assertEqual(args[0]["channel"], "C123")
         self.assertTrue(daemon)
+
+    def test_execute_robot_intent_say_enables_llm_remote_before_remote_control(self):
+        parsed = {
+            "target_scope": "single",
+            "target_robot_id": "TestTonyPi",
+            "intent": {"action": "say", "arguments": {"text": "hello"}},
+        }
+        robot = {"id": "TestTonyPi", "base_url": "http://robot", "token": "abc"}
+        with mock.patch("app._robot_registry", return_value=[robot]), \
+             mock.patch("app._ensure_robot_remote_mode", return_value={"ok": True, "response": {"ok": True}}) as ensure_mode, \
+             mock.patch("app._robot_remote_text_command", return_value={"ok": True, "robot_id": "TestTonyPi", "response": {"ok": True}}) as remote_cmd, \
+             mock.patch("app._audit_robot_action"):
+            result = app._execute_robot_intent(parsed)
+
+        self.assertTrue(result["ok"])
+        ensure_mode.assert_called_once_with(robot)
+        remote_cmd.assert_called_once_with(robot, "say hello", sender={"source": "robot-console-ai"})
+
+    def test_execute_robot_intent_say_returns_mode_enable_failure(self):
+        parsed = {
+            "target_scope": "single",
+            "target_robot_id": "TestTonyPi",
+            "intent": {"action": "say", "arguments": {"text": "hello"}},
+        }
+        robot = {"id": "TestTonyPi", "base_url": "http://robot", "token": "abc"}
+        with mock.patch("app._robot_registry", return_value=[robot]), \
+             mock.patch("app._ensure_robot_remote_mode", return_value={"ok": False, "response": {"user_message": "Turn robot LLM remote on"}}), \
+             mock.patch("app._robot_remote_text_command") as remote_cmd, \
+             mock.patch("app._audit_robot_action"):
+            result = app._execute_robot_intent(parsed)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["results"][0]["error"], "failed_to_enable_llm_remote")
+        remote_cmd.assert_not_called()
 
 
 if __name__ == '__main__':
