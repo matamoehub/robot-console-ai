@@ -70,6 +70,31 @@ class RobotBrainParseTests(unittest.TestCase):
         self.assertEqual(result["steps"][0]["intent"]["arguments"]["command"], "wave")
         self.assertEqual(result["steps"][1]["intent"]["action"], "say")
 
+    def test_parse_say_text_with_and_does_not_split(self):
+        result = parse_text_command_plan("Tell Tony01 to say hello and goodbye", ROBOTS, preferred_robot_id="Tony01")
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["steps"]), 1)
+        self.assertEqual(result["intent"]["action"], "say")
+        self.assertTrue(result["intent"]["executable"])
+        self.assertEqual(result["intent"]["arguments"]["text"], "hello and goodbye")
+
+    def test_parse_multi_step_preserves_per_step_targets(self):
+        result = parse_text_command_plan("Tony01 wave then Mata01 say hello", ROBOTS, preferred_robot_id="Tony01")
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["steps"]), 2)
+        self.assertEqual(result["steps"][0]["target_robot_id"], "Tony01")
+        self.assertEqual(result["steps"][1]["target_robot_id"], "Mata01")
+        self.assertEqual(result["steps"][0]["intent"]["arguments"]["command"], "wave")
+        self.assertEqual(result["steps"][1]["intent"]["action"], "say")
+
+    def test_parse_filler_prefix_keeps_first_recognized_action(self):
+        result = parse_text_command_plan("This is a test message. say hello", ROBOTS, preferred_robot_id="Tony01")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["intent"]["action"], "say")
+        self.assertTrue(result["intent"]["executable"])
+        self.assertEqual(len(result["steps"]), 1)
+        self.assertEqual(result["steps"][0]["intent"]["action"], "say")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -325,7 +325,14 @@ def _is_non_command_phrase(text: str) -> bool:
     lowered = str(text or "").strip().lower().strip(".!? ,;:")
     if not lowered:
         return True
-    return lowered in NON_COMMAND_PHRASES
+    return any(lowered == phrase or lowered.startswith(f"{phrase} ") for phrase in NON_COMMAND_PHRASES)
+
+
+def _should_split_command_plan(text: str) -> bool:
+    say_text = _extract_say_text(text)
+    if say_text and re.search(r"\b(?:and|then)\b", say_text, re.IGNORECASE):
+        return False
+    return True
 
 
 def parse_text_command(text: str, robots: List[Dict[str, Any]], preferred_robot_id: str = "") -> Dict[str, Any]:
@@ -456,9 +463,9 @@ def parse_text_command(text: str, robots: List[Dict[str, Any]], preferred_robot_
 def _normalize_step_payload(payload: Dict[str, Any], target_scope: str, target_robot_id: str, mentioned_robot_ids: List[str], source_text: str) -> Dict[str, Any]:
     step_intent = payload.get("intent") if isinstance(payload.get("intent"), dict) else {}
     return {
-        "target_scope": target_scope,
-        "target_robot_id": target_robot_id,
-        "mentioned_robot_ids": list(mentioned_robot_ids),
+        "target_scope": str(payload.get("target_scope") or target_scope or "single"),
+        "target_robot_id": str(payload.get("target_robot_id") or target_robot_id or ""),
+        "mentioned_robot_ids": list(payload.get("mentioned_robot_ids") or mentioned_robot_ids),
         "source": payload.get("source") or "rules",
         "text": source_text,
         "intent": {
@@ -476,6 +483,18 @@ def parse_text_command_plan(text: str, robots: List[Dict[str, Any]], preferred_r
         return base
 
     raw_text = str(text or "").strip()
+    if not _should_split_command_plan(raw_text):
+        base["steps"] = [
+            _normalize_step_payload(
+                base,
+                str(base.get("target_scope") or "single"),
+                str(base.get("target_robot_id") or ""),
+                list(base.get("mentioned_robot_ids") or []),
+                raw_text,
+            )
+        ]
+        return base
+
     split_chunks = [
         chunk.strip(" \t\r\n.;:!?")
         for chunk in re.split(r"\s+(?:and|then)\s+|[,\n;]+|(?<=[.!?])\s+", raw_text)
@@ -513,8 +532,13 @@ def parse_text_command_plan(text: str, robots: List[Dict[str, Any]], preferred_r
             if not _is_non_command_phrase(step.get("text") or ""):
                 filtered_steps.append(step)
         steps = filtered_steps or recognized_steps
+        recognized_steps = [step for step in steps if str((step.get("intent") or {}).get("action") or "") != "unknown"]
 
-    first_step = steps[0] if steps else {}
+    if recognized_steps:
+        first_step = recognized_steps[0]
+    else:
+        first_step = steps[0] if steps else {}
+
     first_intent = first_step.get("intent") if isinstance(first_step.get("intent"), dict) else {}
     base["intent"] = {
         "action": str(first_intent.get("action") or base.get("intent", {}).get("action") or "unknown"),
