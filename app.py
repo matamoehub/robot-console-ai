@@ -598,11 +598,131 @@ def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", m
     return result
 
 
+def _compact_audit_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 4:
+        return "[truncated]"
+    if isinstance(value, list):
+        if not value:
+            return []
+        simple_items = []
+        for item in value[:8]:
+            simple_items.append(_compact_audit_value(item, depth=depth + 1))
+        if len(value) > 8:
+            simple_items.append(f"... {len(value) - 8} more")
+        return simple_items
+    if not isinstance(value, dict):
+        return value
+
+    if "available_robots" in value:
+        robots = value.get("available_robots") if isinstance(value.get("available_robots"), list) else []
+        value = dict(value)
+        value["available_robots"] = {
+            "count": len(robots),
+            "ids": [str(item.get("id") or "") for item in robots[:8] if isinstance(item, dict)],
+        }
+
+    preferred_keys = (
+        "ok",
+        "error",
+        "mode",
+        "source",
+        "text",
+        "target_scope",
+        "target_robot_id",
+        "mentioned_robot_ids",
+        "summary",
+        "action",
+        "intent",
+        "arguments",
+        "sender",
+        "preview",
+        "execution",
+        "results",
+        "result",
+        "step_results",
+        "target_count",
+        "multi_step",
+        "robot_id",
+        "status_code",
+        "url",
+        "elapsed_ms",
+        "response",
+        "mode_result",
+        "hint",
+    )
+    out: Dict[str, Any] = {}
+    for key in preferred_keys:
+        if key in value:
+            out[key] = _compact_audit_value(value[key], depth=depth + 1)
+
+    if "intent" in out and isinstance(out["intent"], dict):
+        intent = out["intent"]
+        intent_keys = ("action", "executable", "summary", "arguments")
+        out["intent"] = {key: intent[key] for key in intent_keys if key in intent}
+
+    if "preview" in out and isinstance(out["preview"], dict):
+        preview = out["preview"]
+        preview_keys = ("target_scope", "target_robot_id", "summary", "action")
+        out["preview"] = {key: preview[key] for key in preview_keys if key in preview}
+
+    if "sender" in out and isinstance(out["sender"], dict):
+        sender = out["sender"]
+        sender_keys = ("source", "channel_id", "user_id", "thread_ts", "display_name", "username", "chat_id", "device_id")
+        out["sender"] = {key: sender[key] for key in sender_keys if key in sender and sender[key] not in ("", None)}
+
+    if "response" in out and isinstance(out["response"], dict):
+        response = out["response"]
+        response_keys = ("ok", "error", "message", "current_mode")
+        compact_response = {key: response[key] for key in response_keys if key in response}
+        if not compact_response and "raw" in response:
+            compact_response["raw"] = str(response.get("raw") or "")[:200]
+        out["response"] = compact_response or "[response omitted]"
+
+    if "results" in out and isinstance(out["results"], list):
+        trimmed_results = []
+        for item in out["results"][:8]:
+            if isinstance(item, dict):
+                trimmed_results.append(
+                    {
+                        key: item[key]
+                        for key in ("ok", "robot_id", "error", "status_code", "elapsed_ms", "url", "response", "mode_result")
+                        if key in item
+                    }
+                )
+            else:
+                trimmed_results.append(item)
+        if len(out["results"]) > 8:
+            trimmed_results.append(f"... {len(out['results']) - 8} more")
+        out["results"] = trimmed_results
+
+    if "step_results" in out and isinstance(out["step_results"], list):
+        trimmed_steps = []
+        for item in out["step_results"][:8]:
+            if isinstance(item, dict):
+                trimmed_steps.append(
+                    {
+                        key: _compact_audit_value(item[key], depth=depth + 1)
+                        for key in ("index", "text", "intent", "result")
+                        if key in item
+                    }
+                )
+            else:
+                trimmed_steps.append(item)
+        if len(out["step_results"]) > 8:
+            trimmed_steps.append(f"... {len(out['step_results']) - 8} more")
+        out["step_results"] = trimmed_steps
+
+    for key in ("source", "text", "preferred_robot_id", "mode"):
+        if key in value and key not in out:
+            out[key] = _compact_audit_value(value[key], depth=depth + 1)
+    return out
+
+
 def _audit_robot_action(event_type: str, payload: Dict[str, Any]) -> None:
     entry = {
         "ts": int(time.time()),
         "event": str(event_type or "").strip() or "unknown",
-        "payload": payload,
+        "payload": _compact_audit_value(payload),
     }
     try:
         with ROBOT_BRAIN_AUDIT_LOG.open("a", encoding="utf-8") as handle:
