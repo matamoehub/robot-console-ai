@@ -994,20 +994,7 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         if action == "say":
-            mode_res = _ensure_robot_remote_mode(robot)
-            if not mode_res.get("ok"):
-                result = {
-                    "ok": False,
-                    "robot_id": robot.get("id"),
-                    "error": "failed_to_enable_llm_remote",
-                    "mode_result": mode_res,
-                }
-            else:
-                result = _robot_remote_text_command(
-                    robot,
-                    f'say {str(args.get("text") or "").strip()}',
-                    sender={"source": "robot-console-ai"},
-                )
+            result = _robot_request(robot, "POST", "/api/cmd/say", {"text": str(args.get("text") or "").strip()}, timeout=20.0)
         elif action == "soundoff":
             result = _robot_request(robot, "POST", "/api/cmd/soundoff", {}, timeout=15.0)
         elif action == "allstop":
