@@ -1,5 +1,7 @@
 import json
 import logging
+import hashlib
+import hmac
 import mimetypes
 import os
 import secrets
@@ -100,6 +102,15 @@ ROBOT_TEXT_COMMAND_MODEL = (
 )
 ROBOT_BRAIN_API_TOKEN = (os.environ.get("ROBOT_BRAIN_API_TOKEN") or "").strip()
 TELEGRAM_EXECUTION_MODE = (os.environ.get("TELEGRAM_EXECUTION_MODE", "live").strip() or "live").lower()
+SLACK_SIGNING_SECRET = (os.environ.get("SLACK_SIGNING_SECRET") or "").strip()
+SLACK_BOT_TOKEN = (os.environ.get("SLACK_BOT_TOKEN") or "").strip()
+SLACK_ALLOWED_CHANNEL_IDS = {
+    item.strip()
+    for item in (os.environ.get("SLACK_ALLOWED_CHANNEL_IDS") or "").split(",")
+    if item.strip()
+}
+SLACK_DEFAULT_ROBOT_ID = (os.environ.get("SLACK_DEFAULT_ROBOT_ID") or "").strip()
+SLACK_EXECUTION_MODE = (os.environ.get("SLACK_EXECUTION_MODE", "test").strip() or "test").lower()
 ROBOT_BRAIN_AUDIT_LOG = Path(
     os.environ.get("ROBOT_BRAIN_AUDIT_LOG", "/opt/robot/logs/robot-brain-actions.log")
 ).expanduser()
@@ -363,6 +374,70 @@ def _http_json_request(method: str, url: str, *, payload: Dict[str, Any] | None 
         }
     except Exception as exc:
         return {"ok": False, "url": url, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "error": str(exc)}
+
+
+def _slack_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    started = time.perf_counter()
+    if not SLACK_BOT_TOKEN:
+        return {"ok": False, "error": "missing_slack_bot_token"}
+    try:
+        import requests
+
+        response = requests.post(
+            f"https://slack.com/api/{method}",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            timeout=45.0,
+        )
+        data = response.json()
+        return {
+            "ok": bool(response.ok and data.get("ok")),
+            "status_code": response.status_code,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            "response": data,
+        }
+    except Exception as exc:
+        return {"ok": False, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1), "error": str(exc)}
+
+
+def _slack_signature_ok(req) -> bool:
+    if not SLACK_SIGNING_SECRET:
+        return False
+    timestamp = str(req.headers.get("X-Slack-Request-Timestamp") or "").strip()
+    signature = str(req.headers.get("X-Slack-Signature") or "").strip()
+    if not timestamp or not signature:
+        return False
+    try:
+        age = abs(time.time() - int(timestamp))
+    except Exception:
+        return False
+    if age > 60 * 5:
+        return False
+    body = req.get_data(cache=True)
+    digest = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode("utf-8"),
+        f"v0:{timestamp}:".encode("utf-8") + body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(digest, signature)
+
+
+def _slack_allowed_channel(channel_id: str) -> bool:
+    if not SLACK_ALLOWED_CHANNEL_IDS:
+        return True
+    return str(channel_id or "").strip() in SLACK_ALLOWED_CHANNEL_IDS
+
+
+def _slack_clean_text(text: str) -> str:
+    cleaned = []
+    for part in str(text or "").split():
+        if part.startswith("<@") and part.endswith(">"):
+            continue
+        cleaned.append(part)
+    return " ".join(cleaned).strip()
 
 
 def _stt_extension_for_mime(mime_type: str) -> str:
@@ -813,14 +888,21 @@ def _execute_robot_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _chat_text_ingest(
+    text: str,
+    robot_id: str = "",
+    mode: str = "test",
+    sender: Optional[Dict[str, Any]] = None,
+    *,
+    audit_event_type: str,
+) -> Dict[str, Any]:
     chosen_mode = (mode or "test").strip().lower()
     if chosen_mode not in {"test", "live"}:
         return {"ok": False, "error": "invalid_mode", "mode": chosen_mode}
     parsed = _parse_robot_text_request(text, preferred_robot_id=robot_id, use_llm=True)
     if not parsed.get("ok"):
         result = {"ok": False, "mode": chosen_mode, "sender": sender or {}, "parsed": parsed}
-        _audit_robot_action("telegram", result)
+        _audit_robot_action(audit_event_type, result)
         return result
     payload = {
         "ok": True,
@@ -837,13 +919,79 @@ def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: 
     if chosen_mode == "test":
         payload["message"] = "Preview only. No robot command was executed."
         payload["planned_steps"] = parsed.get("steps") or []
-        _audit_robot_action("telegram", payload)
+        _audit_robot_action(audit_event_type, payload)
         return payload
     execution = _execute_robot_intent(parsed)
     payload["execution"] = execution
     payload["ok"] = bool(execution.get("ok"))
-    _audit_robot_action("telegram", payload)
+    _audit_robot_action(audit_event_type, payload)
     return payload
+
+
+def _telegram_ingest(text: str, robot_id: str = "", mode: str = "test", sender: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _chat_text_ingest(text, robot_id=robot_id, mode=mode, sender=sender, audit_event_type="telegram")
+
+
+def _slack_ingest(text: str, robot_id: str = "", mode: str = "test", sender: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _chat_text_ingest(text, robot_id=robot_id, mode=mode, sender=sender, audit_event_type="slack")
+
+
+def _format_slack_result(result: Dict[str, Any]) -> str:
+    if not result.get("ok"):
+        parsed = result.get("parsed") if isinstance(result.get("parsed"), dict) else {}
+        error = str(result.get("error") or parsed.get("error") or "command_failed")
+        return f"Robot command failed: {error}"
+    preview = result.get("preview") if isinstance(result.get("preview"), dict) else {}
+    parsed = result.get("parsed") if isinstance(result.get("parsed"), dict) else {}
+    summary = str(preview.get("summary") or ((parsed.get("intent") or {}).get("summary")) or "done").strip()
+    lines = [f"Robot command: {summary}", f"Mode: {result.get('mode') or SLACK_EXECUTION_MODE}"]
+    execution = result.get("execution") if isinstance(result.get("execution"), dict) else {}
+    for item in execution.get("results") or []:
+        robot_id = str(item.get("robot_id") or "robot")
+        status = "ok" if item.get("ok") else "failed"
+        lines.append(f"- {robot_id}: {status}")
+    if result.get("mode") == "test":
+        lines.append("Preview only. No live robot command was sent.")
+    return "\n".join(lines)
+
+
+def _process_slack_event(event: Dict[str, Any]) -> None:
+    event_type = str(event.get("type") or "").strip()
+    if event_type not in {"message", "app_mention"}:
+        return
+    if event.get("bot_id") or event.get("subtype"):
+        return
+    channel_id = str(event.get("channel") or "").strip()
+    if not channel_id or not _slack_allowed_channel(channel_id):
+        return
+    text = _slack_clean_text(str(event.get("text") or ""))
+    if not text:
+        return
+    sender = {
+        "source": "slack",
+        "channel_id": channel_id,
+        "user_id": str(event.get("user") or "").strip(),
+        "thread_ts": str(event.get("thread_ts") or event.get("ts") or "").strip(),
+    }
+    result = _slack_ingest(
+        text,
+        robot_id=SLACK_DEFAULT_ROBOT_ID,
+        mode=SLACK_EXECUTION_MODE,
+        sender=sender,
+    )
+    reply = _format_slack_result(result)
+    post_result = _slack_api(
+        "chat.postMessage",
+        {
+            "channel": channel_id,
+            "thread_ts": sender["thread_ts"],
+            "text": reply,
+            "unfurl_links": False,
+            "unfurl_media": False,
+        },
+    )
+    if not post_result.get("ok"):
+        LOGGER.error("Slack reply failed channel=%s result=%s", channel_id, post_result)
 
 
 def _voice_command_from_request(
@@ -1500,6 +1648,23 @@ def api_brain_telegram_ingest():
         },
     )
     return jsonify(result), (200 if result.get("ok") else 503 if str(result.get("mode") or "") == "live" else 400)
+
+
+@APP.post("/api/brain/slack/events")
+def api_brain_slack_events():
+    if not SLACK_SIGNING_SECRET:
+        return jsonify({"ok": False, "error": "slack_not_configured"}), 503
+    if not _slack_signature_ok(request):
+        return jsonify({"ok": False, "error": "invalid_slack_signature"}), 401
+    body = request.get_json(silent=True) or {}
+    if str(body.get("type") or "") == "url_verification":
+        return jsonify({"challenge": str(body.get("challenge") or "")})
+    if str(body.get("type") or "") != "event_callback":
+        return jsonify({"ok": True, "ignored": True})
+    event = body.get("event") if isinstance(body.get("event"), dict) else {}
+    thread = threading.Thread(target=_process_slack_event, args=(event,), daemon=True)
+    thread.start()
+    return jsonify({"ok": True})
 
 
 @APP.post("/api/admin/update-restart")

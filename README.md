@@ -402,6 +402,53 @@ sudo systemctl enable telegram-robot-bot
 sudo systemctl restart telegram-robot-bot
 ```
 
+### Slack bot
+
+This repo can also accept Slack channel messages and route them through the same robot brain used by the admin UI and Telegram.
+
+Configure these env values on the HQ Pi:
+
+```bash
+SLACK_SIGNING_SECRET=...
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_ALLOWED_CHANNEL_IDS=C0123456789
+SLACK_DEFAULT_ROBOT_ID=Mata01
+SLACK_EXECUTION_MODE=test
+```
+
+The Flask app exposes the Slack Events API callback here:
+
+- `POST /api/brain/slack/events`
+
+Recommended first-pass setup:
+
+1. Create a Slack app for your workspace.
+2. Enable a bot user and install the app to the workspace.
+3. Add bot token scopes:
+   - `channels:history`
+   - `chat:write`
+   - `groups:history`
+4. In Slack Event Subscriptions, enable events and set the Request URL to:
+
+```text
+https://YOUR-ROBOT-HOST/api/brain/slack/events
+```
+
+5. Subscribe to bot events:
+   - `message.channels`
+   - `message.groups`
+   - `app_mention`
+6. Invite the bot into your dedicated robot-control channel.
+7. Put that channel ID into `SLACK_ALLOWED_CHANNEL_IDS`.
+8. Restart `robot-console-ai`.
+
+Behavior notes:
+
+- Slack replies are posted back as threaded bot messages.
+- By default the Slack path runs in `test` mode so you can confirm parsing before allowing live robot actions.
+- Switch to `SLACK_EXECUTION_MODE=live` when you are ready for real robot execution.
+- If `SLACK_ALLOWED_CHANNEL_IDS` is empty, any channel the bot can read will be accepted, so a dedicated control channel is strongly recommended.
+
 ## Status
 
 This repo is intended as the dedicated AI admin companion to the main classroom `robot-console`.

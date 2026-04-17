@@ -1,4 +1,8 @@
 import unittest
+import hashlib
+import hmac
+import json
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -47,6 +51,74 @@ class AiServiceAppTest(unittest.TestCase):
         self.assertEqual(data["mode"], "test")
         self.assertEqual(data["transcript"]["text"], "say hello")
         self.assertEqual(data["parsed"]["intent"]["action"], "say")
+
+    def test_slack_url_verification(self):
+        body = {"type": "url_verification", "challenge": "abc123"}
+        payload = json.dumps(body).encode("utf-8")
+        timestamp = "1710000000"
+        secret = "slack-test-secret"
+        signature = "v0=" + hmac.new(
+            secret.encode("utf-8"),
+            f"v0:{timestamp}:".encode("utf-8") + payload,
+            hashlib.sha256,
+        ).hexdigest()
+        with mock.patch.dict(os.environ, {"SLACK_SIGNING_SECRET": secret}, clear=False), \
+             mock.patch("app.SLACK_SIGNING_SECRET", secret), \
+             mock.patch("app.time.time", return_value=int(timestamp)):
+            resp = self.client.post(
+                "/api/brain/slack/events",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Slack-Request-Timestamp": timestamp,
+                    "X-Slack-Signature": signature,
+                },
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["challenge"], "abc123")
+
+    def test_slack_event_dispatches_background_worker(self):
+        body = {
+            "type": "event_callback",
+            "event": {"type": "app_mention", "channel": "C123", "text": "<@Ubot> say hello", "user": "U123", "ts": "123.456"},
+        }
+        payload = json.dumps(body).encode("utf-8")
+        timestamp = "1710000000"
+        secret = "slack-test-secret"
+        signature = "v0=" + hmac.new(
+            secret.encode("utf-8"),
+            f"v0:{timestamp}:".encode("utf-8") + payload,
+            hashlib.sha256,
+        ).hexdigest()
+        started = []
+
+        class DummyThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                started.append((self.target, self.args, self.daemon))
+
+        with mock.patch("app.SLACK_SIGNING_SECRET", secret), \
+             mock.patch("app.time.time", return_value=int(timestamp)), \
+             mock.patch("app.threading.Thread", side_effect=DummyThread):
+            resp = self.client.post(
+                "/api/brain/slack/events",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Slack-Request-Timestamp": timestamp,
+                    "X-Slack-Signature": signature,
+                },
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(started)
+        target, args, daemon = started[0]
+        self.assertEqual(target.__name__, "_process_slack_event")
+        self.assertEqual(args[0]["channel"], "C123")
+        self.assertTrue(daemon)
 
 
 if __name__ == '__main__':
