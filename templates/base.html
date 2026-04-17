@@ -43,6 +43,58 @@
   {% endwith %}
   {% block content %}{% endblock %}
 </div>
+<script>
+  (function () {
+    const navModeBadge = document.getElementById('navModeBadge');
+    let navModePollTimer = null;
+
+    function applyBadge(text, className) {
+      if (!navModeBadge) return;
+      navModeBadge.textContent = text;
+      navModeBadge.className = `mode-pill ${className}`;
+    }
+
+    function applyModeStatus(status) {
+      const mode = String((status && status.active_mode) || 'unknown');
+      if (mode === 'llm') {
+        applyBadge('Mode: LLM', 'active-llm');
+        return;
+      }
+      if (mode === 'vlm') {
+        applyBadge('Mode: VLM', 'active-vlm');
+        return;
+      }
+      if (mode === 'shared') {
+        applyBadge('Mode: shared', 'active-llm');
+        return;
+      }
+      applyBadge('Mode: unknown', 'inactive');
+    }
+
+    async function refreshNavModeBadge() {
+      try {
+        const response = await fetch('/api/admin/hailo/mode', { credentials: 'same-origin', cache: 'no-store' });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok) {
+          applyModeStatus({ active_mode: 'unknown' });
+          return;
+        }
+        applyModeStatus(payload);
+      } catch (_err) {
+        applyModeStatus({ active_mode: 'unknown' });
+      }
+    }
+
+    window.applyNavModeStatus = applyModeStatus;
+    window.refreshNavModeBadge = refreshNavModeBadge;
+
+    refreshNavModeBadge();
+    navModePollTimer = window.setInterval(refreshNavModeBadge, 10000);
+    window.addEventListener('beforeunload', function () {
+      if (navModePollTimer) window.clearInterval(navModePollTimer);
+    });
+  }());
+</script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

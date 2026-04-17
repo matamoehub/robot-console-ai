@@ -238,6 +238,7 @@
   function renderHailoMode(status) {
     const mode = String((status && status.active_mode) || 'unknown');
     currentHailoMode = mode;
+    if (window.applyNavModeStatus) window.applyNavModeStatus(status);
     const apply = (el, text, className) => {
       if (!el) return;
       el.textContent = text;
@@ -796,6 +797,7 @@
     }
     renderHailoMode(j.status || j);
     await refreshServices();
+    if (window.refreshNavModeBadge) await window.refreshNavModeBadge();
     show(j);
   }
 
