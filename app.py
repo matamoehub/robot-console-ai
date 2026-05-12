@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -97,6 +99,8 @@ STT_DEFAULT_LANGUAGE = (os.environ.get("STT_DEFAULT_LANGUAGE", "en").strip() or 
 STT_TRANSCRIBE_TIMEOUT = float(os.environ.get("STT_TRANSCRIBE_TIMEOUT", "90").strip() or "90")
 STT_USES_HAILO = (os.environ.get("STT_USES_HAILO", "0").strip() or "0").lower() in {"1", "true", "yes", "on"}
 STT_BACKEND_PERSISTENT = (os.environ.get("STT_BACKEND_PERSISTENT", "1").strip() or "1").lower() not in {"0", "false", "no", "off"}
+_STT_MAX_WORKERS = int(os.environ.get("STT_MAX_WORKERS", "2"))
+_STT_EXECUTOR = ThreadPoolExecutor(max_workers=_STT_MAX_WORKERS, thread_name_prefix="stt-worker")
 ROBOT_REGISTRY_FILE = Path(
     os.environ.get("ROBOT_REGISTRY_FILE", "/opt/robot/robot-console/robots.json")
 ).expanduser()
@@ -245,6 +249,31 @@ def need_login(fn):
     def wrap(*args, **kwargs):
         if session.get("user") != ADMIN_USER:
             return redirect(url_for("login_page", next=request.path))
+        return fn(*args, **kwargs)
+
+    return wrap
+
+
+def _csrf_token() -> str:
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+    return session["csrf_token"]
+
+
+def csrf_protect(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def wrap(*args, **kwargs):
+        token = (
+            request.headers.get("X-CSRF-Token")
+            or (request.get_json(silent=True) or {}).get("csrf_token")
+            or request.form.get("csrf_token")
+            or ""
+        )
+        expected = session.get("csrf_token") or ""
+        if not expected or not secrets.compare_digest(token, expected):
+            return jsonify({"ok": False, "error": "csrf_token_invalid"}), 403
         return fn(*args, **kwargs)
 
     return wrap
@@ -902,6 +931,32 @@ def _api_token_ok(req) -> bool:
 
 _registry_cache: Dict[str, Any] = {}
 
+
+# Simple per-IP rate limiter: max N requests per window (deque-based, no external deps).
+_RATE_LIMIT_MAX = int(os.environ.get("BRAIN_RATE_LIMIT_MAX", "30"))
+_RATE_LIMIT_WINDOW = float(os.environ.get("BRAIN_RATE_LIMIT_WINDOW_S", "60"))
+_rate_buckets: Dict[str, deque] = {}
+_rate_lock = threading.Lock()
+
+def _rate_limit_exceeded(ip: str) -> bool:
+    now = time.monotonic()
+    with _rate_lock:
+        bucket = _rate_buckets.setdefault(ip, deque())
+        cutoff = now - _RATE_LIMIT_WINDOW
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= _RATE_LIMIT_MAX:
+            return True
+        bucket.append(now)
+        return False
+
+
+@APP.before_request
+def _brain_rate_limit():
+    if request.path.startswith("/api/brain/"):
+        ip = request.remote_addr or "unknown"
+        if _rate_limit_exceeded(ip):
+            return jsonify({"ok": False, "error": "rate_limit_exceeded"}), 429
 
 def _robot_registry() -> List[Dict[str, Any]]:
     """Load robots from the shared registry JSON, caching by file mtime.
@@ -1793,9 +1848,16 @@ def login():
     password = request.form.get("password", "")
     if user == ADMIN_USER and check_password_hash(PASS_HASH, password):
         session["user"] = ADMIN_USER
+        _csrf_token()  # ensure token is seeded on login
         return redirect(request.args.get("next") or url_for("admin_page"))
     flash("Invalid username or password", "danger")
     return render_template("login.html"), 401
+
+
+@APP.get("/api/admin/csrf-token")
+@need_login
+def api_admin_csrf_token():
+    return jsonify({"ok": True, "csrf_token": _csrf_token()})
 
 
 @APP.get("/logout")
@@ -1845,6 +1907,7 @@ def api_admin_services():
 
 @APP.post("/api/admin/services/<service_key>/<action>")
 @need_login
+@csrf_protect
 def api_admin_service_action(service_key: str, action: str):
     item = AI_SERVICE_MAP.get((service_key or "").strip())
     if not item:
@@ -1898,6 +1961,7 @@ def api_admin_hailo_mode():
 
 @APP.post("/api/admin/hailo/mode/<target>")
 @need_login
+@csrf_protect
 def api_admin_hailo_mode_switch(target: str):
     result = _switch_hailo_mode(target)
     if result.get("ok"):
@@ -2251,16 +2315,24 @@ def api_brain_voice_command():
     if not _api_token_ok(request):
         return jsonify({"ok": False, "error": "invalid_api_token"}), 401
     body = request.get_json(silent=True) or {}
-    result = _voice_command_from_request(
+    execute_live = bool(body.get("execute_live"))
+    fut = _STT_EXECUTOR.submit(
+        _voice_command_from_request,
         body,
-        execute_live=bool(body.get("execute_live")),
+        execute_live=execute_live,
         sender={
             "source": "api-voice",
             "device_id": str(body.get("device_id") or "").strip(),
             "display_name": str(body.get("display_name") or "").strip(),
         },
     )
-    status = 200 if result.get("ok") else 503 if bool(body.get("execute_live")) else 400
+    try:
+        result = fut.result(timeout=STT_TRANSCRIBE_TIMEOUT + 10)
+    except FuturesTimeout:
+        result = {"ok": False, "error": "stt_timeout"}
+    except Exception as e:
+        result = {"ok": False, "error": str(e)}
+    status = 200 if result.get("ok") else 503 if execute_live else 400
     return jsonify(_public_robot_response(result)), status
 
 
@@ -2302,6 +2374,7 @@ def api_brain_slack_events():
 
 @APP.post("/api/admin/update-restart")
 @need_login
+@csrf_protect
 def api_admin_update_restart():
     repo_dir = APP_REPO_DIR
     if not (repo_dir / ".git").exists():
@@ -2359,6 +2432,7 @@ def api_admin_update_tests_status():
 
 @APP.post("/api/admin/tests/run")
 @need_login
+@csrf_protect
 def api_admin_tests_run():
     repo_dir = APP_REPO_DIR
     if not (repo_dir / ".git").exists():
