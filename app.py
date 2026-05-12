@@ -104,6 +104,12 @@ ROBOT_TEXT_COMMAND_MODEL = (
     os.environ.get("ROBOT_TEXT_COMMAND_MODEL", "qwen2:1.5b").strip() or "qwen2:1.5b"
 )
 ROBOT_BRAIN_API_TOKEN = (os.environ.get("ROBOT_BRAIN_API_TOKEN") or "").strip()
+if not ROBOT_BRAIN_API_TOKEN:
+    import logging as _startup_log
+    _startup_log.getLogger(__name__).warning(
+        "[robot-console-ai] SECURITY WARNING: ROBOT_BRAIN_API_TOKEN is not set — "
+        "all /api/brain/* endpoints are unauthenticated. Set ROBOT_BRAIN_API_TOKEN in your env."
+    )
 TELEGRAM_EXECUTION_MODE = (os.environ.get("TELEGRAM_EXECUTION_MODE", "live").strip() or "live").lower()
 SLACK_SIGNING_SECRET = (os.environ.get("SLACK_SIGNING_SECRET") or "").strip()
 SLACK_BOT_TOKEN = (os.environ.get("SLACK_BOT_TOKEN") or "").strip()
@@ -344,7 +350,7 @@ def _start_post_update_tasks_detached(repo_dir: Path, service_name: str) -> Dict
         f"echo \"$trc\" > {q_rc}; "
         f"echo \"tests_rc=$trc\" >> {q_log}; "
         f"echo \"restart_mode={restart_mode}\" >> {q_log}; "
-        f"echo '$ {restart_cmd}' >> {q_log}; "
+        f"echo \"$ {restart_cmd}\" >> {q_log}; "
         f"{restart_cmd} >> {q_log} 2>&1; "
         "rst=$?; "
         f"echo \"restart_rc=$rst\" >> {q_log}; "
@@ -573,11 +579,18 @@ class _STTProcess:
 _STT_PROCESS = _STTProcess()
 atexit.register(_STT_PROCESS.close)
 
+_AUDIO_PATH_ALLOWLIST = (
+    Path("/tmp"),
+    Path("/opt/robot"),
+)
+
 
 def _materialize_audio_payload(body: Dict[str, Any]) -> tuple[Optional[Path], Optional[str]]:
     audio_path = str(body.get("audio_path") or "").strip()
     if audio_path:
-        p = Path(audio_path).expanduser()
+        p = Path(audio_path).expanduser().resolve()
+        if not any(str(p).startswith(str(base)) for base in _AUDIO_PATH_ALLOWLIST):
+            return None, "audio_path_not_allowed"
         if not p.exists():
             return None, "audio_path_not_found"
         return p, None
