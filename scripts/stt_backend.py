@@ -77,6 +77,36 @@ def _command_transcribe(audio_path: Path, payload: dict) -> dict:
     }
 
 
+def _transcribe_payload(payload: dict) -> dict:
+    audio_path = Path(str(payload.get("audio_path") or "").strip()).expanduser()
+    if not audio_path.exists():
+        return {"ok": False, "error": "audio_path_not_found"}
+    if BACKEND_MODE == "command":
+        return _command_transcribe(audio_path, payload)
+    return _mock_transcribe(audio_path, payload)
+
+
+def serve() -> None:
+    """Persistent serve mode: read one JSON request per stdin line, write one JSON response per stdout line.
+
+    This keeps the process (and any loaded model) warm between requests, eliminating
+    per-request process-startup and model-load overhead when used with the Hailo STT backend.
+    """
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            payload = json.loads(raw_line)
+        except Exception:
+            sys.stdout.write(json.dumps({"ok": False, "error": "invalid_json"}) + "\n")
+            sys.stdout.flush()
+            continue
+        result = _transcribe_payload(payload)
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
 def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
@@ -84,19 +114,13 @@ def main() -> int:
         _emit({"ok": False, "error": "invalid_json"})
         return 1
 
-    audio_path = Path(str(payload.get("audio_path") or "").strip()).expanduser()
-    if not audio_path.exists():
-        _emit({"ok": False, "error": "audio_path_not_found"})
-        return 1
-
-    if BACKEND_MODE == "command":
-        result = _command_transcribe(audio_path, payload)
-    else:
-        result = _mock_transcribe(audio_path, payload)
-
+    result = _transcribe_payload(payload)
     _emit(result)
     return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if "--serve" in sys.argv:
+        serve()
+    else:
+        raise SystemExit(main())

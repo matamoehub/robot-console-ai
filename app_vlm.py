@@ -215,6 +215,28 @@ BACKEND_PROCESS = _BackendProcess()
 atexit.register(BACKEND_PROCESS.close)
 
 
+def _warmup_vlm_backend() -> None:
+    """Start the persistent backend process at launch so the first real request is fast."""
+    if not BACKEND_CMD or not BACKEND_PERSISTENT:
+        return
+    try:
+        BACKEND_PROCESS.request(
+            {
+                "prompt": "warmup",
+                "image_path": "",
+                "image_base64": "",
+                "image_mime_type": "",
+                "model": MODEL_ID,
+                "max_tokens": 1,
+            }
+        )
+    except Exception:
+        pass  # Hailo model may not be ready yet; first real request will retry
+
+
+threading.Thread(target=_warmup_vlm_backend, daemon=True, name="vlm-warmup").start()
+
+
 def _invoke_backend(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not BACKEND_CMD:
         return {

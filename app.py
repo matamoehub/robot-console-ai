@@ -1,3 +1,5 @@
+import atexit
+import concurrent.futures
 import json
 import logging
 import hashlib
@@ -94,6 +96,7 @@ STT_BACKEND_MODE = (os.environ.get("STT_BACKEND_MODE", "mock").strip() or "mock"
 STT_DEFAULT_LANGUAGE = (os.environ.get("STT_DEFAULT_LANGUAGE", "en").strip() or "en")
 STT_TRANSCRIBE_TIMEOUT = float(os.environ.get("STT_TRANSCRIBE_TIMEOUT", "90").strip() or "90")
 STT_USES_HAILO = (os.environ.get("STT_USES_HAILO", "0").strip() or "0").lower() in {"1", "true", "yes", "on"}
+STT_BACKEND_PERSISTENT = (os.environ.get("STT_BACKEND_PERSISTENT", "1").strip() or "1").lower() not in {"0", "false", "no", "off"}
 ROBOT_REGISTRY_FILE = Path(
     os.environ.get("ROBOT_REGISTRY_FILE", "/opt/robot/robot-console/robots.json")
 ).expanduser()
@@ -188,6 +191,17 @@ def _load_ai_services() -> List[Dict[str, Any]]:
 AI_SERVICES = _load_ai_services()
 AI_SERVICE_MAP = {svc["key"]: svc for svc in AI_SERVICES}
 HAILO_DEVICE_LOCK = threading.RLock()
+
+# Persistent HTTP session with connection pooling.  Reusing TCP connections to
+# the local Hailo Ollama API and robot endpoints saves a TCP handshake on every
+# call.  Pool sizes are intentionally small — this is a Pi, not a server farm.
+import requests as _requests_lib  # noqa: E402 (deferred so env file loads first)
+from requests.adapters import HTTPAdapter as _HTTPAdapter
+
+_HTTP_SESSION = _requests_lib.Session()
+_HTTP_SESSION.mount("http://", _HTTPAdapter(pool_connections=4, pool_maxsize=8))
+_HTTP_SESSION.mount("https://", _HTTPAdapter(pool_connections=2, pool_maxsize=4))
+atexit.register(_HTTP_SESSION.close)
 
 
 def need_login(fn):
@@ -357,12 +371,10 @@ def _service_health(url: str) -> Dict[str, Any]:
 def _http_json_request(method: str, url: str, *, payload: Dict[str, Any] | None = None, timeout: float = 120.0) -> Dict[str, Any]:
     started = time.perf_counter()
     try:
-        import requests
-
         kwargs: Dict[str, Any] = {"timeout": timeout}
         if payload is not None:
             kwargs["json"] = payload
-        r = requests.request(method.upper(), url, **kwargs)
+        r = _HTTP_SESSION.request(method.upper(), url, **kwargs)
         content_type = (r.headers.get("content-type") or "").lower()
         data = r.json() if "application/json" in content_type else {"raw": r.text}
         return {
@@ -381,9 +393,7 @@ def _slack_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not SLACK_BOT_TOKEN:
         return {"ok": False, "error": "missing_slack_bot_token"}
     try:
-        import requests
-
-        response = requests.post(
+        response = _HTTP_SESSION.post(
             f"https://slack.com/api/{method}",
             json=payload,
             headers={
@@ -452,6 +462,88 @@ def _stt_extension_for_mime(mime_type: str) -> str:
         return ".mp3"
     guessed = mimetypes.guess_extension(lowered or "audio/wav")
     return guessed or ".wav"
+
+
+class _STTProcess:
+    """Persistent STT backend subprocess.
+
+    Mirrors the VLM _BackendProcess pattern.  Keeps the stt_backend.py process
+    (and any Hailo Whisper model it loaded) warm between calls.  The process
+    communicates via newline-delimited JSON on stdin/stdout.
+
+    Only used when STT_BACKEND_PERSISTENT is True.  Falls back transparently
+    to a one-shot subprocess if the persistent process dies unexpectedly.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen[str] | None = None
+
+    def _start(self) -> subprocess.Popen[str]:
+        backend_cmd = STT_BACKEND_CMD
+        if not backend_cmd:
+            default_script = APP_DIR / "scripts" / "stt_backend.py"
+            backend_cmd = f"python3 {shlex.quote(str(default_script))}"
+        cmd = [*shlex.split(backend_cmd), "--serve"]
+        LOGGER.info("Starting persistent STT backend cmd=%s", " ".join(cmd))
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._proc = proc
+        return proc
+
+    def request(self, payload: Dict[str, Any], timeout: float = 120.0) -> Dict[str, Any]:
+        with self._lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                proc = self._start()
+            if proc.stdin is None or proc.stdout is None:
+                raise RuntimeError("stt_backend_pipes_unavailable")
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+            if not line:
+                stderr_text = ""
+                if proc.stderr is not None:
+                    try:
+                        import select as _select
+                        ready, _, _ = _select.select([proc.stderr], [], [], 0.1)
+                        if ready:
+                            stderr_text = proc.stderr.read(4096)
+                    except Exception:
+                        pass
+                self._proc = None
+                raise RuntimeError(stderr_text.strip() or "stt_backend_no_response")
+            return json.loads(line)
+
+    def close(self) -> None:
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+            if proc is None:
+                return
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+_STT_PROCESS = _STTProcess()
+atexit.register(_STT_PROCESS.close)
 
 
 def _materialize_audio_payload(body: Dict[str, Any]) -> tuple[Optional[Path], Optional[str]]:
@@ -523,11 +615,6 @@ def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", m
         LOGGER.error("STT audio path not found path=%s", audio_path)
         return {"ok": False, "error": "audio_path_not_found", "audio_path": str(audio_path)}
 
-    backend_cmd = STT_BACKEND_CMD
-    if not backend_cmd:
-        default_script = APP_DIR / "scripts" / "stt_backend.py"
-        backend_cmd = f"python3 {shlex.quote(str(default_script))}"
-
     payload = {
         "audio_path": str(audio_path),
         "prompt": str(prompt or "").strip(),
@@ -536,52 +623,74 @@ def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", m
     }
     started = time.perf_counter()
     LOGGER.info("Starting STT transcription backend_mode=%s audio_path=%s language=%s", STT_BACKEND_MODE, audio_path, payload["language"])
-    try:
-        proc = subprocess.run(
-            shlex.split(backend_cmd),
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            timeout=STT_TRANSCRIBE_TIMEOUT,
-            check=False,
-        )
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": "stt_backend_exec_failed",
-            "cmd": backend_cmd,
-            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
-            "detail": str(exc),
-        }
 
-    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-    stdout = (proc.stdout or "").strip()
-    stderr = (proc.stderr or "").strip()
-    if proc.returncode != 0:
-        LOGGER.error(
-            "STT backend failed returncode=%s elapsed_ms=%s cmd=%s stdout=%s stderr=%s",
-            proc.returncode,
-            elapsed_ms,
-            backend_cmd,
-            stdout,
-            stderr,
-        )
-        return {
-            "ok": False,
-            "error": "stt_backend_failed",
-            "cmd": backend_cmd,
-            "returncode": proc.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "elapsed_ms": elapsed_ms,
-        }
-    try:
-        parsed = json.loads(stdout) if stdout else {}
-    except Exception:
-        parsed = {"ok": True, "text": stdout}
+    # Use the persistent backend process when configured to do so.
+    # This keeps the Hailo Whisper model warm and eliminates model-load latency
+    # on every voice command.  Mock mode is always fast, so persistence there
+    # is a no-op — the --serve loop still works because mock transcription is
+    # instantaneous.
+    use_persistent = STT_BACKEND_PERSISTENT and STT_BACKEND_MODE == "command"
+    if use_persistent:
+        try:
+            parsed = _STT_PROCESS.request(payload, timeout=STT_TRANSCRIBE_TIMEOUT)
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+            LOGGER.error("STT persistent backend failed elapsed_ms=%s error=%s", elapsed_ms, exc)
+            return {
+                "ok": False,
+                "error": "stt_backend_exec_failed",
+                "elapsed_ms": elapsed_ms,
+                "detail": str(exc),
+            }
+        stderr = ""
+    else:
+        backend_cmd = STT_BACKEND_CMD
+        if not backend_cmd:
+            default_script = APP_DIR / "scripts" / "stt_backend.py"
+            backend_cmd = f"python3 {shlex.quote(str(default_script))}"
+        try:
+            proc = subprocess.run(
+                shlex.split(backend_cmd),
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=STT_TRANSCRIBE_TIMEOUT,
+                check=False,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": "stt_backend_exec_failed",
+                "cmd": backend_cmd,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                "detail": str(exc),
+            }
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        if proc.returncode != 0:
+            LOGGER.error(
+                "STT backend failed returncode=%s elapsed_ms=%s cmd=%s stderr=%s",
+                proc.returncode, elapsed_ms, backend_cmd, stderr,
+            )
+            return {
+                "ok": False,
+                "error": "stt_backend_failed",
+                "cmd": backend_cmd,
+                "returncode": proc.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "elapsed_ms": elapsed_ms,
+            }
+        try:
+            parsed = json.loads(stdout) if stdout else {}
+        except Exception:
+            parsed = {"ok": True, "text": stdout}
+        backend_cmd = backend_cmd  # noqa (for result label below)
+
     result = {
         "ok": bool(parsed.get("ok", True)),
-        "cmd": backend_cmd,
         "elapsed_ms": elapsed_ms,
         "text": str(parsed.get("text") or "").strip(),
         "language": str(parsed.get("language") or payload["language"]).strip(),
@@ -590,7 +699,7 @@ def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", m
     if stderr:
         result["stderr"] = stderr
     if not result["text"]:
-        LOGGER.error("STT returned empty transcript elapsed_ms=%s cmd=%s stderr=%s stdout=%s", elapsed_ms, backend_cmd, stderr, stdout)
+        LOGGER.error("STT returned empty transcript elapsed_ms=%s stderr=%s", elapsed_ms, stderr)
         result["ok"] = False
         result["error"] = str(parsed.get("error") or "empty_transcript")
     else:
@@ -750,8 +859,25 @@ def _api_token_ok(req) -> bool:
     return bool(supplied) and secrets.compare_digest(supplied, expected)
 
 
+_registry_cache: Dict[str, Any] = {}
+
+
 def _robot_registry() -> List[Dict[str, Any]]:
-    return load_robot_registry(ROBOT_REGISTRY_FILE)
+    """Load robots from the shared registry JSON, caching by file mtime.
+
+    The file is read from disk only when it actually changes.  This eliminates
+    repeated JSON parses for the parse → execute double-call pattern and keeps
+    the hot path (Telegram/Slack/voice commands) allocation-free most of the time.
+    """
+    try:
+        mtime = ROBOT_REGISTRY_FILE.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if _registry_cache.get("mtime") == mtime:
+        return _registry_cache["robots"]  # type: ignore[return-value]
+    robots = load_robot_registry(ROBOT_REGISTRY_FILE)
+    _registry_cache.update({"mtime": mtime, "robots": robots})
+    return robots
 
 
 def _robot_by_id(robot_id: str) -> Optional[Dict[str, Any]]:
@@ -771,8 +897,6 @@ def _robot_request(robot: Dict[str, Any], method: str, path: str, payload: Dict[
     url = f"{base_url}{path}"
     started = time.perf_counter()
     try:
-        import requests
-
         headers = {}
         token = str(robot.get("token") or "").strip()
         if token:
@@ -780,7 +904,7 @@ def _robot_request(robot: Dict[str, Any], method: str, path: str, payload: Dict[
         kwargs: Dict[str, Any] = {"timeout": timeout, "headers": headers}
         if payload is not None:
             kwargs["json"] = payload
-        response = requests.request(method.upper(), url, **kwargs)
+        response = _HTTP_SESSION.request(method.upper(), url, **kwargs)
         content_type = (response.headers.get("content-type") or "").lower()
         data = response.json() if "application/json" in content_type else {"raw": response.text}
         return {
@@ -827,7 +951,9 @@ def _robot_remote_text_command(robot: Dict[str, Any], text: str, sender: Optiona
 
 def _parse_robot_text_with_llm(text: str, robots: List[Dict[str, Any]], preferred_robot_id: str = "") -> Dict[str, Any]:
     prompt = build_llm_parser_prompt(text, robots, preferred_robot_id=preferred_robot_id)
-    llm_res = _hailo_ollama_chat(ROBOT_TEXT_COMMAND_MODEL, prompt, options={"num_predict": 192})
+    # temperature=0 → deterministic output, no wasted sampling cycles.
+    # num_predict=128 → the JSON response is ≤100 tokens; 192 was generous.
+    llm_res = _hailo_ollama_chat(ROBOT_TEXT_COMMAND_MODEL, prompt, options={"num_predict": 128, "temperature": 0})
     parsed_text = (((llm_res.get("response") or {}).get("message") or {}).get("content") or "").strip()
     parsed_json = extract_json_object(parsed_text)
     if not parsed_json:
@@ -1394,26 +1520,44 @@ def _switch_hailo_mode(target: str) -> Dict[str, Any]:
         if not health.get("ok"):
             return {"ok": False, "error": "desired_health_failed", "target": target, "steps": steps}
 
+        # Invalidate the cached mode so the next call re-probes immediately.
+        _hailo_mode_cache.clear()
         return {"ok": True, "target": target, "steps": steps}
 
 
-def _hailo_mode_status() -> Dict[str, Any]:
-    llm_health = _service_health(f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list")
-    vlm_health = _service_health(f"{VLM_API_BASE_URL.rstrip('/')}/healthz")
-    llm_status = _service_status({
+_hailo_mode_cache: Dict[str, Any] = {}
+_HAILO_MODE_TTL = 8.0  # seconds — mode only changes on an explicit admin switch
+
+
+def _hailo_mode_status_uncached() -> Dict[str, Any]:
+    """Probe Hailo service state.
+
+    Runs the LLM and VLM _service_status calls in parallel (each does one HTTP
+    health check + one systemctl show).  This replaces the previous sequential
+    approach that made 4 I/O calls one after another and also called
+    _service_health() separately, resulting in duplicate HTTP requests.
+    """
+    llm_item = {
         "key": "hailo-ollama",
         "label": "Hailo Ollama",
         "service_name": HAILO_OLLAMA_SERVICE_NAME,
         "description": "",
         "health_url": f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list",
-    })
-    vlm_status = _service_status({
+    }
+    vlm_item = {
         "key": "vlm-service",
         "label": "VLM Service",
         "service_name": VLM_SERVICE_UNIT_NAME,
         "description": "",
         "health_url": f"{VLM_API_BASE_URL.rstrip('/')}/healthz",
-    })
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_llm = ex.submit(_service_status, llm_item)
+        f_vlm = ex.submit(_service_status, vlm_item)
+    llm_status = f_llm.result()
+    vlm_status = f_vlm.result()
+    llm_health = llm_status.get("health", {})
+    vlm_health = vlm_status.get("health", {})
     active_mode = "unknown"
     if llm_health.get("ok") and not vlm_health.get("ok"):
         active_mode = "llm"
@@ -1427,6 +1571,21 @@ def _hailo_mode_status() -> Dict[str, Any]:
         "llm": llm_status,
         "vlm": vlm_status,
     }
+
+
+def _hailo_mode_status() -> Dict[str, Any]:
+    """Return Hailo mode, using a short-lived cache to avoid repeated I/O.
+
+    The mode is stable between explicit admin switches, so probing on every
+    parse request (Telegram, Slack, voice) is wasteful.  The cache is
+    invalidated immediately when _switch_hailo_mode() completes.
+    """
+    now = time.monotonic()
+    if _hailo_mode_cache.get("ts", 0.0) + _HAILO_MODE_TTL > now:
+        return _hailo_mode_cache["value"]  # type: ignore[return-value]
+    value = _hailo_mode_status_uncached()
+    _hailo_mode_cache.update({"ts": now, "value": value})
+    return value
 
 
 def _service_logs(item: Dict[str, Any], lines: int = 120) -> Dict[str, Any]:

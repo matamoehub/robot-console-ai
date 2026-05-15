@@ -12,4 +12,4 @@ fi
 mkdir -p static/vendor/bootstrap
 [ -f /usr/share/javascript/bootstrap5/bootstrap.min.css ] && cp /usr/share/javascript/bootstrap5/bootstrap.min.css static/vendor/bootstrap/
 [ -f /usr/share/javascript/bootstrap5/bootstrap.bundle.min.js ] && cp /usr/share/javascript/bootstrap5/bootstrap.bundle.min.js static/vendor/bootstrap/
-FLASK_APP=app.py FLASK_RUN_PORT=8080 flask run --host 0.0.0.0 --port 8080
+exec gunicorn -w 1 --threads 4 -b 0.0.0.0:8080 --timeout 180 --access-logfile - "app:APP"

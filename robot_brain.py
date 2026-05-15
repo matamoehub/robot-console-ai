@@ -601,10 +601,18 @@ def parse_text_command_plan(text: str, robots: List[Dict[str, Any]], preferred_r
 
 
 def build_llm_parser_prompt(text: str, robots: List[Dict[str, Any]], preferred_robot_id: str = "") -> str:
-    robot_lines = []
-    for robot in robots:
-        robot_lines.append(f'- {robot["id"]} ({robot.get("robot_type") or "robot"})')
     preferred = preferred_robot_id.strip()
+    # Keep the robot list short to reduce LLM prefill time.  When a preferred
+    # robot is known and the fleet is large, only list that robot plus a few
+    # others so the model can still resolve explicit mentions.
+    real_robots = [r for r in robots if not r.get("test_mode")]
+    if preferred and len(real_robots) > 4:
+        preferred_entries = [r for r in real_robots if r["id"] == preferred]
+        other_entries = [r for r in real_robots if r["id"] != preferred][:3]
+        trimmed = preferred_entries + other_entries
+    else:
+        trimmed = real_robots or robots
+    robot_lines = [f'- {r["id"]} ({r.get("robot_type") or "robot"})' for r in trimmed]
     return f"""You are a strict robot command parser.
 
 Return exactly one JSON object and no markdown.
