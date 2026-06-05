@@ -178,7 +178,7 @@
           <div class="col-12 col-lg-4">
             <label class="form-label">Preview &amp; Detections</label>
             <div class="border rounded p-1" style="min-height:200px; background:#111; position:relative;">
-              <canvas id="yoloCanvas" class="w-100 rounded d-none" style="max-height:320px; object-fit:contain; display:block;"></canvas>
+              <canvas id="yoloCanvas" class="rounded d-none" style="display:block;"></canvas>
               <div id="yoloNoImage" class="text-muted small p-3">(no image selected)</div>
             </div>
           </div>
@@ -987,35 +987,68 @@
   }
 
   // Draw the image + bounding boxes on the preview canvas.
+  // Bounding box coords from the API are in original image pixel space.
+  // We scale the canvas to fit the panel, then scale coords by the same ratio.
   function drawYoloCanvas(dataUrl, detections) {
     if (!yoloCanvas || !yoloNoImage) return;
     const img = new Image();
     img.onload = () => {
       yoloNoImage.classList.add('d-none');
       yoloCanvas.classList.remove('d-none');
-      yoloCanvas.style.display = 'block';
-      yoloCanvas.width  = img.naturalWidth;
-      yoloCanvas.height = img.naturalHeight;
+
+      // Fit to the container: full width, max 340px tall, preserve aspect ratio.
+      // object-fit doesn't work on <canvas> so we do the maths ourselves.
+      const container = yoloCanvas.parentElement;
+      const maxW = Math.max(200, (container?.clientWidth  || 600) - 8);
+      const maxH = 340;
+      const scale = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight, 1);
+      const dispW = Math.round(img.naturalWidth  * scale);
+      const dispH = Math.round(img.naturalHeight * scale);
+
+      // Set canvas buffer AND CSS size to the same display size.
+      yoloCanvas.width  = dispW;
+      yoloCanvas.height = dispH;
+      yoloCanvas.style.width  = dispW + 'px';
+      yoloCanvas.style.height = dispH + 'px';
+      yoloCanvas.style.removeProperty('max-height');
+      yoloCanvas.style.removeProperty('object-fit');
+
       const ctx = yoloCanvas.getContext('2d');
-      ctx.drawImage(img, 0, 0);
+      ctx.clearRect(0, 0, dispW, dispH);
+      ctx.drawImage(img, 0, 0, dispW, dispH);
 
       const COLORS = ['#e74c3c','#2ecc71','#3498db','#f39c12','#9b59b6','#1abc9c','#e67e22','#16a085'];
-      (detections || []).forEach((det, i) => {
-        const [x1, y1, x2, y2] = det.bbox || [0,0,0,0];
-        const w = x2 - x1, h = y2 - y1;
-        if (w <= 0 || h <= 0) return;
-        const color  = COLORS[i % COLORS.length];
-        const label  = `${det.class} ${Math.round((det.confidence || 0) * 100)}%`;
-        const fsize  = Math.max(11, Math.min(16, Math.round(h * 0.08)));
+      const lw = Math.max(2, Math.round(dispW / 300));   // line width scales with image
+
+      (detections || []).forEach((det, idx) => {
+        const [ox1, oy1, ox2, oy2] = det.bbox || [0, 0, 0, 0];
+        // Scale from original image pixel coords to canvas display coords.
+        const x1 = ox1 * scale, y1 = oy1 * scale;
+        const bw = (ox2 - ox1) * scale, bh = (oy2 - oy1) * scale;
+        if (bw <= 0 || bh <= 0) return;
+
+        const color  = COLORS[idx % COLORS.length];
+        const pct    = Math.round((det.confidence || 0) * 100);
+        const label  = `${det.class} ${pct}%`;
+        const fsize  = Math.max(11, Math.min(18, Math.round(bh * 0.18)));
+        const pad    = 4;
+
+        // Bounding box
         ctx.strokeStyle = color;
-        ctx.lineWidth   = Math.max(2, Math.round(img.naturalWidth / 320));
-        ctx.strokeRect(x1, y1, w, h);
-        ctx.fillStyle   = color;
-        const pad = 3;
-        ctx.fillRect(x1, y1 - fsize - pad * 2, ctx.measureText(label).width + pad * 2, fsize + pad * 2);
-        ctx.fillStyle   = '#fff';
-        ctx.font        = `bold ${fsize}px sans-serif`;
-        ctx.fillText(label, x1 + pad, y1 - pad);
+        ctx.lineWidth   = lw;
+        ctx.strokeRect(x1, y1, bw, bh);
+
+        // Label pill — clamp to top of canvas if box is near the top edge
+        ctx.font = `bold ${fsize}px sans-serif`;
+        const tw     = ctx.measureText(label).width;
+        const pillH  = fsize + pad * 2;
+        const pillY  = y1 >= pillH ? y1 - pillH : y1 + bh;
+        ctx.fillStyle = color;
+        ctx.fillRect(x1 - lw / 2, pillY, tw + pad * 2, pillH);
+
+        // Label text
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, x1 + pad - lw / 2, pillY + fsize + pad - 2);
       });
     };
     img.src = dataUrl;
