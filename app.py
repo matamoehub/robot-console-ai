@@ -2011,7 +2011,23 @@ def api_admin_yolo_detect():
         return jsonify({"ok": False, "error": "missing_image_data_url_or_image_path"}), 400
 
     result = _yolo_detect_request(payload)
-    return jsonify(result), (200 if result.get("ok") else 503)
+    if not result.get("ok"):
+        return jsonify(result), 503
+
+    # _http_json_request wraps the YOLO service JSON inside a "response" key.
+    # Flatten it here so the browser gets a clean, direct response.
+    inner = result.get("response") if isinstance(result.get("response"), dict) else {}
+    flat: Dict[str, Any] = {
+        "ok":           bool(inner.get("ok", result.get("ok"))),
+        "model":        str(inner.get("model") or payload.get("model") or "yolov11s"),
+        "detections":   list(inner.get("detections") or []),
+        "count":        int(inner.get("count") or len(inner.get("detections") or [])),
+        "backend_mode": str(inner.get("backend_mode") or ""),
+        "inference_ms": float(inner.get("elapsed_ms") or 0),
+        "http_ms":      float(result.get("elapsed_ms") or 0),
+        "elapsed_ms":   float(inner.get("elapsed_ms") or result.get("elapsed_ms") or 0),
+    }
+    return jsonify(flat), 200
 
 
 @APP.post("/api/brain/vision/event")
