@@ -92,7 +92,13 @@ COCO_CLASSES: List[str] = [
 # ---------------------------------------------------------------------------
 
 def _mock_detections(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return deterministic or configured fake detections."""
+    """Return deterministic or configured fake detections.
+
+    Coordinates are expressed as fractions of the image size so they look
+    correct on any uploaded image.  If the caller passes image_width and
+    image_height we convert to absolute pixel coords; otherwise we fall back
+    to absolute coords sized for a 640×640 frame.
+    """
     if MOCK_DETECTIONS_JSON:
         try:
             return json.loads(MOCK_DETECTIONS_JSON)
@@ -100,20 +106,36 @@ def _mock_detections(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             pass
 
     threshold = float(payload.get("confidence_threshold") or 0.5)
-    max_det = int(payload.get("max_detections") or 20)
+    max_det   = int(payload.get("max_detections") or 20)
+    img_w     = int(payload.get("image_width")  or 640)
+    img_h     = int(payload.get("image_height") or 640)
 
-    # Seed with image path for reproducibility across calls.
-    rng = random.Random(str(payload.get("image_path") or "") or "mock")
-
-    candidates = [
-        {"class": "person",    "class_id":  0, "confidence": 0.92, "bbox": [ 50,  30, 280, 430]},
-        {"class": "chair",     "class_id": 56, "confidence": 0.84, "bbox": [310, 200, 520, 470]},
-        {"class": "laptop",    "class_id": 63, "confidence": 0.77, "bbox": [140, 250, 310, 360]},
-        {"class": "cell phone","class_id": 67, "confidence": 0.61, "bbox": [200, 300, 260, 380]},
-        {"class": "dog",       "class_id": 16, "confidence": 0.53, "bbox": [380,  80, 600, 400]},
+    # Normalised bbox coords (x1, y1, x2, y2) as fractions of image size.
+    # These look reasonable regardless of the image dimensions.
+    candidates_norm = [
+        {"class": "person",    "class_id":  0, "confidence": 0.92, "bbox_n": [0.05, 0.04, 0.44, 0.95]},
+        {"class": "chair",     "class_id": 56, "confidence": 0.84, "bbox_n": [0.48, 0.30, 0.82, 0.97]},
+        {"class": "laptop",    "class_id": 63, "confidence": 0.77, "bbox_n": [0.22, 0.52, 0.49, 0.75]},
+        {"class": "cell phone","class_id": 67, "confidence": 0.61, "bbox_n": [0.31, 0.62, 0.41, 0.79]},
+        {"class": "dog",       "class_id": 16, "confidence": 0.53, "bbox_n": [0.59, 0.12, 0.94, 0.83]},
     ]
 
-    result = [d for d in candidates if d["confidence"] >= threshold]
+    result = []
+    for c in candidates_norm:
+        if c["confidence"] < threshold:
+            continue
+        x1n, y1n, x2n, y2n = c["bbox_n"]
+        result.append({
+            "class":      c["class"],
+            "class_id":   c["class_id"],
+            "confidence": c["confidence"],
+            "bbox": [
+                int(x1n * img_w), int(y1n * img_h),
+                int(x2n * img_w), int(y2n * img_h),
+            ],
+        })
+
+    rng = random.Random(str(payload.get("image_path") or "") or "mock")
     rng.shuffle(result)
     return result[:max_det]
 

@@ -177,8 +177,10 @@
           </div>
           <div class="col-12 col-lg-4">
             <label class="form-label">Preview &amp; Detections</label>
-            <div class="border rounded p-1" style="min-height:200px; background:#111; position:relative;">
-              <canvas id="yoloCanvas" class="rounded d-none" style="display:block;"></canvas>
+            <!-- img handles scaling; canvas is a transparent overlay for boxes -->
+            <div id="yoloPreviewWrap" class="border rounded" style="min-height:200px; background:#111; position:relative; overflow:hidden;">
+              <img id="yoloPreviewImg" alt="yolo preview" class="d-none" style="width:100%; max-height:340px; object-fit:contain; display:block;">
+              <canvas id="yoloCanvas" class="d-none" style="position:absolute; top:0; left:0; pointer-events:none;"></canvas>
               <div id="yoloNoImage" class="text-muted small p-3">(no image selected)</div>
             </div>
           </div>
@@ -950,6 +952,7 @@
   const yoloImage        = document.getElementById('yoloImage');
   const yoloCamera       = document.getElementById('yoloCamera');
   const yoloCaptureCanvas= document.getElementById('yoloCaptureCanvas');
+  const yoloPreviewImg   = document.getElementById('yoloPreviewImg');
   const yoloCanvas       = document.getElementById('yoloCanvas');
   const yoloNoImage      = document.getElementById('yoloNoImage');
   const yoloDetList      = document.getElementById('yoloDetectionList');
@@ -962,8 +965,8 @@
   const btnYoloCapture   = document.getElementById('btnYoloCaptureCamera');
   const btnYoloClose     = document.getElementById('btnYoloCloseCamera');
 
-  let yoloImageDataUrl  = '';
-  let yoloCameraStream  = null;
+  let yoloImageDataUrl = '';
+  let yoloCameraStream = null;
 
   function showYolo(v) {
     if (!yoloOut) return;
@@ -977,98 +980,130 @@
   }
 
   function stopYoloCamera() {
-    if (yoloCameraStream) {
-      yoloCameraStream.getTracks().forEach(t => t.stop());
-      yoloCameraStream = null;
-    }
+    if (yoloCameraStream) { yoloCameraStream.getTracks().forEach(t => t.stop()); yoloCameraStream = null; }
     if (yoloCamera) { yoloCamera.classList.add('d-none'); yoloCamera.srcObject = null; }
     if (btnYoloCapture) btnYoloCapture.disabled = true;
     if (btnYoloClose)   btnYoloClose.disabled   = true;
   }
 
-  // Draw the image + bounding boxes on the preview canvas.
-  // Bounding box coords from the API are in original image pixel space.
-  // We scale the canvas to fit the panel, then scale coords by the same ratio.
-  function drawYoloCanvas(dataUrl, detections) {
-    if (!yoloCanvas || !yoloNoImage) return;
-    const img = new Image();
-    img.onload = () => {
-      yoloNoImage.classList.add('d-none');
-      yoloCanvas.classList.remove('d-none');
-
-      // Fit to the container: full width, max 340px tall, preserve aspect ratio.
-      // object-fit doesn't work on <canvas> so we do the maths ourselves.
-      const container = yoloCanvas.parentElement;
-      const maxW = Math.max(200, (container?.clientWidth  || 600) - 8);
-      const maxH = 340;
-      const scale = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight, 1);
-      const dispW = Math.round(img.naturalWidth  * scale);
-      const dispH = Math.round(img.naturalHeight * scale);
-
-      // Set canvas buffer AND CSS size to the same display size.
-      yoloCanvas.width  = dispW;
-      yoloCanvas.height = dispH;
-      yoloCanvas.style.width  = dispW + 'px';
-      yoloCanvas.style.height = dispH + 'px';
-      yoloCanvas.style.removeProperty('max-height');
-      yoloCanvas.style.removeProperty('object-fit');
-
-      const ctx = yoloCanvas.getContext('2d');
-      ctx.clearRect(0, 0, dispW, dispH);
-      ctx.drawImage(img, 0, 0, dispW, dispH);
-
-      const COLORS = ['#e74c3c','#2ecc71','#3498db','#f39c12','#9b59b6','#1abc9c','#e67e22','#16a085'];
-      const lw = Math.max(2, Math.round(dispW / 300));   // line width scales with image
-
-      (detections || []).forEach((det, idx) => {
-        const [ox1, oy1, ox2, oy2] = det.bbox || [0, 0, 0, 0];
-        // Scale from original image pixel coords to canvas display coords.
-        const x1 = ox1 * scale, y1 = oy1 * scale;
-        const bw = (ox2 - ox1) * scale, bh = (oy2 - oy1) * scale;
-        if (bw <= 0 || bh <= 0) return;
-
-        const color  = COLORS[idx % COLORS.length];
-        const pct    = Math.round((det.confidence || 0) * 100);
-        const label  = `${det.class} ${pct}%`;
-        const fsize  = Math.max(11, Math.min(18, Math.round(bh * 0.18)));
-        const pad    = 4;
-
-        // Bounding box
-        ctx.strokeStyle = color;
-        ctx.lineWidth   = lw;
-        ctx.strokeRect(x1, y1, bw, bh);
-
-        // Label pill — clamp to top of canvas if box is near the top edge
-        ctx.font = `bold ${fsize}px sans-serif`;
-        const tw     = ctx.measureText(label).width;
-        const pillH  = fsize + pad * 2;
-        const pillY  = y1 >= pillH ? y1 - pillH : y1 + bh;
-        ctx.fillStyle = color;
-        ctx.fillRect(x1 - lw / 2, pillY, tw + pad * 2, pillH);
-
-        // Label text
-        ctx.fillStyle = '#fff';
-        ctx.fillText(label, x1 + pad - lw / 2, pillY + fsize + pad - 2);
-      });
+  // Show the image in the <img> element and clear any previous boxes.
+  function showYoloPreview(dataUrl) {
+    if (!yoloPreviewImg) return;
+    yoloPreviewImg.onload = () => {
+      yoloPreviewImg.classList.remove('d-none');
+      if (yoloNoImage) yoloNoImage.classList.add('d-none');
+      // Show canvas overlay (empty — no boxes yet).
+      if (yoloCanvas) {
+        yoloCanvas.classList.remove('d-none');
+        clearYoloBoxes();
+      }
     };
-    img.src = dataUrl;
+    yoloPreviewImg.src = dataUrl;
   }
 
-  // Render the detection list panel.
+  // Clear the canvas overlay without touching the image.
+  function clearYoloBoxes() {
+    if (!yoloCanvas || !yoloPreviewImg || !yoloPreviewImg.naturalWidth) return;
+    yoloCanvas.width  = yoloPreviewImg.offsetWidth;
+    yoloCanvas.height = yoloPreviewImg.offsetHeight;
+    yoloCanvas.style.width  = yoloPreviewImg.offsetWidth  + 'px';
+    yoloCanvas.style.height = yoloPreviewImg.offsetHeight + 'px';
+    yoloCanvas.getContext('2d').clearRect(0, 0, yoloCanvas.width, yoloCanvas.height);
+  }
+
+  // Draw bounding boxes as a transparent overlay on the canvas.
+  // The <img> element uses object-fit:contain (browser handles scaling).
+  // We replicate object-fit:contain maths to place boxes correctly.
+  function drawYoloBoxes(detections) {
+    if (!yoloCanvas || !yoloPreviewImg || !yoloPreviewImg.naturalWidth) return;
+
+    const natW  = yoloPreviewImg.naturalWidth;
+    const natH  = yoloPreviewImg.naturalHeight;
+    const elemW = yoloPreviewImg.offsetWidth;
+    const elemH = yoloPreviewImg.offsetHeight;
+    if (!elemW || !elemH) return;
+
+    // Match canvas buffer to the img element's CSS size.
+    yoloCanvas.width  = elemW;
+    yoloCanvas.height = elemH;
+    yoloCanvas.style.width  = elemW + 'px';
+    yoloCanvas.style.height = elemH + 'px';
+
+    const ctx = yoloCanvas.getContext('2d');
+    ctx.clearRect(0, 0, elemW, elemH);
+
+    if (!detections || !detections.length) return;
+
+    // object-fit: contain centres the image; compute the rendered rect.
+    const fitScale = Math.min(elemW / natW, elemH / natH);
+    const rendW    = natW * fitScale;
+    const rendH    = natH * fitScale;
+    const offX     = (elemW - rendW) / 2;   // letterbox padding left/right
+    const offY     = (elemH - rendH) / 2;   // letterbox padding top/bottom
+
+    const COLORS = ['#e74c3c','#2ecc71','#3498db','#f39c12','#9b59b6','#1abc9c','#e67e22','#16a085'];
+    const lw = Math.max(2, Math.round(rendW / 300));
+
+    detections.forEach((det, idx) => {
+      const [ox1, oy1, ox2, oy2] = det.bbox || [0, 0, 0, 0];
+      // Map original-image pixel coords → canvas overlay coords.
+      const x1 = offX + ox1 * fitScale;
+      const y1 = offY + oy1 * fitScale;
+      const bw = (ox2 - ox1) * fitScale;
+      const bh = (oy2 - oy1) * fitScale;
+      if (bw <= 0 || bh <= 0) return;
+
+      const color = COLORS[idx % COLORS.length];
+      const pct   = Math.round((det.confidence || 0) * 100);
+      const label = `${det.class} ${pct}%`;
+      const fsize = Math.max(11, Math.min(18, Math.round(bh * 0.2)));
+      const pad   = 4;
+
+      // Bounding box stroke
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = lw;
+      ctx.strokeRect(x1, y1, bw, bh);
+
+      // Label pill — above the box, or below if too near the top edge
+      ctx.font = `bold ${fsize}px sans-serif`;
+      const tw    = ctx.measureText(label).width;
+      const pillH = fsize + pad * 2;
+      const pillY = y1 >= pillH + lw ? y1 - pillH : y1 + bh;
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.88;
+      ctx.fillRect(x1 - lw / 2, pillY, tw + pad * 2, pillH);
+      ctx.globalAlpha = 1;
+
+      ctx.fillStyle = '#fff';
+      ctx.fillText(label, x1 + pad - lw / 2, pillY + fsize + pad - 2);
+    });
+  }
+
+  // Render the sidebar detection list.
   function renderYoloList(detections, elapsedMs) {
     if (!yoloDetList) return;
     if (!detections || !detections.length) {
       yoloDetList.innerHTML = '<span class="text-muted">No objects detected.</span>';
       return;
     }
-    const timingNote = Number.isFinite(elapsedMs) ? `<div class="text-muted mb-2">⏱ ${elapsedMs.toFixed(1)} ms</div>` : '';
+    const timingNote = Number.isFinite(elapsedMs)
+      ? `<div class="text-muted mb-2">⏱ ${elapsedMs.toFixed(1)} ms</div>` : '';
+    const COLORS = ['#e74c3c','#2ecc71','#3498db','#f39c12','#9b59b6','#1abc9c','#e67e22','#16a085'];
     const rows = detections.map((det, i) => {
-      const pct  = Math.round((det.confidence || 0) * 100);
-      const bbox = (det.bbox || []).join(', ');
-      return `<div class="mb-1 pb-1 border-bottom">
-        <span class="fw-semibold">${i + 1}. ${det.class || '?'}</span>
-        <span class="text-muted ms-1">${pct}%</span>
-        <div class="text-muted" style="font-size:0.78em;">bbox [${bbox}]</div>
+      const pct   = Math.round((det.confidence || 0) * 100);
+      const bbox  = (det.bbox || []).join(', ');
+      const color = COLORS[i % COLORS.length];
+      const bar   = Math.round(pct * 0.8);
+      return `<div class="mb-2 pb-1 border-bottom">
+        <div class="d-flex align-items-center gap-1 mb-1">
+          <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${color};flex-shrink:0;"></span>
+          <span class="fw-semibold">${det.class || '?'}</span>
+          <span class="text-muted ms-auto">${pct}%</span>
+        </div>
+        <div style="height:4px;background:#dee2e6;border-radius:2px;">
+          <div style="width:${bar}%;height:100%;background:${color};border-radius:2px;"></div>
+        </div>
+        <div class="text-muted mt-1" style="font-size:0.75em;">bbox [${bbox}]</div>
       </div>`;
     }).join('');
     yoloDetList.innerHTML = timingNote + rows;
@@ -1080,22 +1115,16 @@
     const j = await r.json().catch(() => ({}));
     if (!r.ok || !j.ok) { showYolo(j); return; }
     const models = ((j.response || j).data || []).map(m => String(m && (m.id || m.name || m)).trim()).filter(Boolean);
-    if (models.length) {
-      setModelOptions(yoloModel, models);
-      showYolo(`Loaded models: ${models.join(', ')}`);
-    } else {
-      showYolo('YOLO service running — using default model.');
-    }
+    if (models.length) { setModelOptions(yoloModel, models); showYolo(`Loaded: ${models.join(', ')}`); }
+    else showYolo('YOLO service OK — using default model.');
   }
 
   yoloImage?.addEventListener('change', async () => {
-    const file = yoloImage.files && yoloImage.files[0];
+    const file = yoloImage.files?.[0];
     if (!file) { yoloImageDataUrl = ''; return; }
     try {
       yoloImageDataUrl = await fileToDataUrl(file);
-      if (yoloCanvas) { yoloCanvas.classList.remove('d-none'); yoloCanvas.style.display = 'block'; }
-      if (yoloNoImage) yoloNoImage.classList.add('d-none');
-      drawYoloCanvas(yoloImageDataUrl, []);
+      showYoloPreview(yoloImageDataUrl);
       showYolo(`Ready: ${file.name}`);
     } catch (err) {
       yoloImageDataUrl = '';
@@ -1112,32 +1141,29 @@
       if (btnYoloCapture) btnYoloCapture.disabled = false;
       if (btnYoloClose)   btnYoloClose.disabled   = false;
       showYolo('Camera ready — capture a frame to detect.');
-    } catch (err) {
-      showYolo(`Camera error: ${String(err)}`);
-    }
+    } catch (err) { showYolo(`Camera error: ${String(err)}`); }
   });
 
   btnYoloCapture?.addEventListener('click', () => {
     if (!yoloCamera || !yoloCaptureCanvas || !yoloCameraStream) { showYolo('Open camera first.'); return; }
     const w = yoloCamera.videoWidth || 1280, h = yoloCamera.videoHeight || 720;
     yoloCaptureCanvas.width = w; yoloCaptureCanvas.height = h;
-    const ctx = yoloCaptureCanvas.getContext('2d');
-    ctx.drawImage(yoloCamera, 0, 0, w, h);
+    yoloCaptureCanvas.getContext('2d').drawImage(yoloCamera, 0, 0, w, h);
     yoloImageDataUrl = yoloCaptureCanvas.toDataURL('image/jpeg', 0.92);
-    drawYoloCanvas(yoloImageDataUrl, []);
+    showYoloPreview(yoloImageDataUrl);
     showYolo('Frame captured — click Run Detection.');
   });
 
   btnYoloClose?.addEventListener('click', () => { stopYoloCamera(); showYolo('Camera closed.'); });
-
   btnYoloModels?.addEventListener('click', refreshYoloModels);
 
   btnYoloClear?.addEventListener('click', () => {
     yoloImageDataUrl = '';
-    if (yoloImage) yoloImage.value = '';
-    if (yoloCanvas) { yoloCanvas.classList.add('d-none'); }
-    if (yoloNoImage) { yoloNoImage.classList.remove('d-none'); }
-    if (yoloDetList) yoloDetList.innerHTML = '<span class="text-muted">(run detection to see results)</span>';
+    if (yoloImage)       yoloImage.value = '';
+    if (yoloPreviewImg)  { yoloPreviewImg.src = ''; yoloPreviewImg.classList.add('d-none'); }
+    if (yoloCanvas)      yoloCanvas.classList.add('d-none');
+    if (yoloNoImage)     yoloNoImage.classList.remove('d-none');
+    if (yoloDetList)     yoloDetList.innerHTML = '<span class="text-muted">(run detection to see results)</span>';
     stopYoloCamera();
     setYoloBadge('idle', 'text-bg-secondary');
     showYolo('(no YOLO request yet)');
@@ -1149,15 +1175,20 @@
     setYoloBadge('detecting…', 'text-bg-warning');
     showYolo('Sending image to YOLO service...');
     try {
+      // Send natural image dimensions so the backend can scale mock coords.
+      const imgW = yoloPreviewImg?.naturalWidth  || 0;
+      const imgH = yoloPreviewImg?.naturalHeight || 0;
       const r = await fetch('/api/admin/yolo/detect', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          image_data_url:      yoloImageDataUrl,
-          model:               (yoloModel?.value || 'yolov11s').trim(),
+          image_data_url:       yoloImageDataUrl,
+          model:                (yoloModel?.value || 'yolov11s').trim(),
           confidence_threshold: parseFloat(yoloThreshold?.value || '0.5'),
-          max_detections:      parseInt(yoloMaxDet?.value || '20', 10),
+          max_detections:       parseInt(yoloMaxDet?.value  || '20', 10),
+          image_width:          imgW,
+          image_height:         imgH,
         })
       });
       const j = await r.json().catch(() => ({}));
@@ -1166,29 +1197,29 @@
         showYolo(`Detection failed:\n${JSON.stringify(j, null, 2)}`);
         return;
       }
-      const dets     = j.detections || [];
-      const model    = j.model    || 'yolov11s';
-      const mode     = j.backend_mode || '';
-      const inferMs  = Number.isFinite(j.inference_ms) ? j.inference_ms : j.elapsed_ms;
-      const httpMs   = Number.isFinite(j.http_ms) ? j.http_ms : null;
-      const timingStr = Number.isFinite(inferMs) ? `${inferMs.toFixed(1)} ms inference` : '';
+      const dets      = j.detections || [];
+      const model     = j.model      || 'yolov11s';
+      const mode      = j.backend_mode || '';
+      const inferMs   = Number.isFinite(j.inference_ms) ? j.inference_ms : j.elapsed_ms;
+      const httpMs    = Number.isFinite(j.http_ms) ? j.http_ms : null;
+      const timingStr = Number.isFinite(inferMs) ? `${inferMs.toFixed(1)} ms` : '';
       const httpStr   = httpMs !== null ? ` · ${httpMs.toFixed(1)} ms HTTP` : '';
 
       setYoloBadge(
-        dets.length ? `${dets.length} detected · ${timingStr}` : `0 detected · ${timingStr}`,
+        dets.length ? `${dets.length} detected · ${timingStr}` : `0 detected`,
         dets.length ? 'text-bg-success' : 'text-bg-secondary'
       );
 
-      drawYoloCanvas(yoloImageDataUrl, dets);
+      // Draw boxes after a short frame to let the img layout settle.
+      requestAnimationFrame(() => drawYoloBoxes(dets));
       renderYoloList(dets, inferMs);
 
-      // Clean human-readable summary in the output area.
       const modeTag = mode ? ` [${mode}]` : '';
-      const lines = [`Model: ${model}${modeTag}`, `Detections: ${dets.length}`, `Timing: ${timingStr}${httpStr}`, ''];
+      const lines = [`Model: ${model}${modeTag}`, `Detections: ${dets.length}`,
+                     `Timing: ${timingStr}${httpStr}`, ''];
       dets.forEach((d, i) => {
         const pct  = Math.round((d.confidence || 0) * 100);
-        const bbox = (d.bbox || []).join(', ');
-        lines.push(`  ${i + 1}. ${d.class} — ${pct}% confidence  [${bbox}]`);
+        lines.push(`  ${i + 1}. ${d.class} — ${pct}%  bbox [${(d.bbox || []).join(', ')}]`);
       });
       if (!dets.length) lines.push('  (nothing detected above threshold)');
       showYolo(lines.join('\n'));

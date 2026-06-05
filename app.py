@@ -1992,6 +1992,8 @@ def api_admin_yolo_detect():
         "model": str(body.get("model") or os.environ.get("HAILO_YOLO_MODEL", "yolov11s")).strip(),
         "confidence_threshold": confidence_threshold,
         "max_detections": max_detections,
+        "image_width":  int(body.get("image_width")  or 0) or None,
+        "image_height": int(body.get("image_height") or 0) or None,
     }
 
     if image_data_url:
