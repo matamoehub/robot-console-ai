@@ -149,6 +149,59 @@
     <div class="card">
       <div class="card-body">
         <div class="d-flex justify-content-between align-items-center mb-3">
+          <div class="fw-semibold">YOLO Object Detection</div>
+          <span id="yoloStatusBadge" class="badge text-bg-secondary">idle</span>
+        </div>
+        <div class="row g-3">
+          <div class="col-12 col-lg-2">
+            <label class="form-label" for="yoloModel">Model</label>
+            <select id="yoloModel" class="form-select">
+              <option value="yolov11s" selected>yolov11s</option>
+            </select>
+            <label class="form-label mt-2" for="yoloThreshold">Confidence</label>
+            <input id="yoloThreshold" class="form-control" type="number" min="0.1" max="1.0" step="0.05" value="0.5">
+            <label class="form-label mt-2" for="yoloMaxDet">Max detections</label>
+            <input id="yoloMaxDet" class="form-control" type="number" min="1" max="100" step="1" value="20">
+          </div>
+          <div class="col-12 col-lg-3">
+            <label class="form-label" for="yoloImage">Image</label>
+            <input id="yoloImage" class="form-control" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" capture="environment">
+            <div class="form-text">Upload a photo or capture from the camera below.</div>
+            <div class="d-flex gap-2 flex-wrap mt-2">
+              <button id="btnYoloOpenCamera" class="btn btn-outline-dark btn-sm" type="button">Open Camera</button>
+              <button id="btnYoloCaptureCamera" class="btn btn-outline-primary btn-sm" type="button" disabled>Capture Frame</button>
+              <button id="btnYoloCloseCamera" class="btn btn-outline-secondary btn-sm" type="button" disabled>Close Camera</button>
+            </div>
+            <video id="yoloCamera" class="w-100 rounded border d-none mt-2" autoplay playsinline muted style="max-height: 200px; object-fit: cover;"></video>
+            <canvas id="yoloCaptureCanvas" class="d-none"></canvas>
+          </div>
+          <div class="col-12 col-lg-4">
+            <label class="form-label">Preview &amp; Detections</label>
+            <div class="border rounded p-1" style="min-height:200px; background:#111; position:relative;">
+              <canvas id="yoloCanvas" class="w-100 rounded d-none" style="max-height:320px; object-fit:contain; display:block;"></canvas>
+              <div id="yoloNoImage" class="text-muted small p-3">(no image selected)</div>
+            </div>
+          </div>
+          <div class="col-12 col-lg-3">
+            <label class="form-label">Detected objects</label>
+            <div id="yoloDetectionList" class="border rounded p-2 mono small" style="min-height:200px; max-height:320px; overflow-y:auto; background:#f8f9fa;">
+              <span class="text-muted">(run detection to see results)</span>
+            </div>
+          </div>
+        </div>
+        <div class="mt-3 d-flex gap-2 flex-wrap">
+          <button id="btnYoloDetect" class="btn btn-primary btn-sm" type="button">Run Detection</button>
+          <button id="btnYoloModels" class="btn btn-outline-secondary btn-sm" type="button">Refresh Models</button>
+          <button id="btnYoloClear" class="btn btn-outline-secondary btn-sm" type="button">Clear</button>
+        </div>
+        <pre id="yoloOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap;">(no YOLO request yet)</pre>
+      </div>
+    </div>
+  </div>
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-3">
           <div class="fw-semibold">Robot Command Brain</div>
           <span class="badge text-bg-dark">robot-console-ai -> robot_ops_web</span>
         </div>
@@ -889,10 +942,215 @@
     }
   });
 
+  // ── YOLO panel ────────────────────────────────────────────────────────────
+
+  const yoloModel        = document.getElementById('yoloModel');
+  const yoloThreshold    = document.getElementById('yoloThreshold');
+  const yoloMaxDet       = document.getElementById('yoloMaxDet');
+  const yoloImage        = document.getElementById('yoloImage');
+  const yoloCamera       = document.getElementById('yoloCamera');
+  const yoloCaptureCanvas= document.getElementById('yoloCaptureCanvas');
+  const yoloCanvas       = document.getElementById('yoloCanvas');
+  const yoloNoImage      = document.getElementById('yoloNoImage');
+  const yoloDetList      = document.getElementById('yoloDetectionList');
+  const yoloOut          = document.getElementById('yoloOut');
+  const yoloStatusBadge  = document.getElementById('yoloStatusBadge');
+  const btnYoloDetect    = document.getElementById('btnYoloDetect');
+  const btnYoloModels    = document.getElementById('btnYoloModels');
+  const btnYoloClear     = document.getElementById('btnYoloClear');
+  const btnYoloOpen      = document.getElementById('btnYoloOpenCamera');
+  const btnYoloCapture   = document.getElementById('btnYoloCaptureCamera');
+  const btnYoloClose     = document.getElementById('btnYoloCloseCamera');
+
+  let yoloImageDataUrl  = '';
+  let yoloCameraStream  = null;
+
+  function showYolo(v) {
+    if (!yoloOut) return;
+    yoloOut.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  }
+
+  function setYoloBadge(text, cls = 'text-bg-secondary') {
+    if (!yoloStatusBadge) return;
+    yoloStatusBadge.textContent = text;
+    yoloStatusBadge.className   = `badge ${cls}`;
+  }
+
+  function stopYoloCamera() {
+    if (yoloCameraStream) {
+      yoloCameraStream.getTracks().forEach(t => t.stop());
+      yoloCameraStream = null;
+    }
+    if (yoloCamera) { yoloCamera.classList.add('d-none'); yoloCamera.srcObject = null; }
+    if (btnYoloCapture) btnYoloCapture.disabled = true;
+    if (btnYoloClose)   btnYoloClose.disabled   = true;
+  }
+
+  // Draw the image + bounding boxes on the preview canvas.
+  function drawYoloCanvas(dataUrl, detections) {
+    if (!yoloCanvas || !yoloNoImage) return;
+    const img = new Image();
+    img.onload = () => {
+      yoloNoImage.classList.add('d-none');
+      yoloCanvas.classList.remove('d-none');
+      yoloCanvas.style.display = 'block';
+      yoloCanvas.width  = img.naturalWidth;
+      yoloCanvas.height = img.naturalHeight;
+      const ctx = yoloCanvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+
+      const COLORS = ['#e74c3c','#2ecc71','#3498db','#f39c12','#9b59b6','#1abc9c','#e67e22','#16a085'];
+      (detections || []).forEach((det, i) => {
+        const [x1, y1, x2, y2] = det.bbox || [0,0,0,0];
+        const w = x2 - x1, h = y2 - y1;
+        if (w <= 0 || h <= 0) return;
+        const color  = COLORS[i % COLORS.length];
+        const label  = `${det.class} ${Math.round((det.confidence || 0) * 100)}%`;
+        const fsize  = Math.max(11, Math.min(16, Math.round(h * 0.08)));
+        ctx.strokeStyle = color;
+        ctx.lineWidth   = Math.max(2, Math.round(img.naturalWidth / 320));
+        ctx.strokeRect(x1, y1, w, h);
+        ctx.fillStyle   = color;
+        const pad = 3;
+        ctx.fillRect(x1, y1 - fsize - pad * 2, ctx.measureText(label).width + pad * 2, fsize + pad * 2);
+        ctx.fillStyle   = '#fff';
+        ctx.font        = `bold ${fsize}px sans-serif`;
+        ctx.fillText(label, x1 + pad, y1 - pad);
+      });
+    };
+    img.src = dataUrl;
+  }
+
+  // Render the detection list panel.
+  function renderYoloList(detections, elapsedMs) {
+    if (!yoloDetList) return;
+    if (!detections || !detections.length) {
+      yoloDetList.innerHTML = '<span class="text-muted">No objects detected.</span>';
+      return;
+    }
+    const timingNote = Number.isFinite(elapsedMs) ? `<div class="text-muted mb-2">⏱ ${elapsedMs.toFixed(1)} ms</div>` : '';
+    const rows = detections.map((det, i) => {
+      const pct  = Math.round((det.confidence || 0) * 100);
+      const bbox = (det.bbox || []).join(', ');
+      return `<div class="mb-1 pb-1 border-bottom">
+        <span class="fw-semibold">${i + 1}. ${det.class || '?'}</span>
+        <span class="text-muted ms-1">${pct}%</span>
+        <div class="text-muted" style="font-size:0.78em;">bbox [${bbox}]</div>
+      </div>`;
+    }).join('');
+    yoloDetList.innerHTML = timingNote + rows;
+  }
+
+  async function refreshYoloModels() {
+    showYolo('Loading YOLO models...');
+    const r = await fetch('/api/admin/yolo/models', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { showYolo(j); return; }
+    const models = ((j.response || j).data || []).map(m => String(m && (m.id || m.name || m)).trim()).filter(Boolean);
+    if (models.length) {
+      setModelOptions(yoloModel, models);
+      showYolo(`Loaded models: ${models.join(', ')}`);
+    } else {
+      showYolo('YOLO service running — using default model.');
+    }
+  }
+
+  yoloImage?.addEventListener('change', async () => {
+    const file = yoloImage.files && yoloImage.files[0];
+    if (!file) { yoloImageDataUrl = ''; return; }
+    try {
+      yoloImageDataUrl = await fileToDataUrl(file);
+      if (yoloCanvas) { yoloCanvas.classList.remove('d-none'); yoloCanvas.style.display = 'block'; }
+      if (yoloNoImage) yoloNoImage.classList.add('d-none');
+      drawYoloCanvas(yoloImageDataUrl, []);
+      showYolo(`Ready: ${file.name}`);
+    } catch (err) {
+      yoloImageDataUrl = '';
+      showYolo(`Image load failed: ${String(err)}`);
+    }
+  });
+
+  btnYoloOpen?.addEventListener('click', async () => {
+    if (!navigator.mediaDevices?.getUserMedia) { showYolo('Camera not available.'); return; }
+    try {
+      stopYoloCamera();
+      yoloCameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      if (yoloCamera) { yoloCamera.srcObject = yoloCameraStream; yoloCamera.classList.remove('d-none'); }
+      if (btnYoloCapture) btnYoloCapture.disabled = false;
+      if (btnYoloClose)   btnYoloClose.disabled   = false;
+      showYolo('Camera ready — capture a frame to detect.');
+    } catch (err) {
+      showYolo(`Camera error: ${String(err)}`);
+    }
+  });
+
+  btnYoloCapture?.addEventListener('click', () => {
+    if (!yoloCamera || !yoloCaptureCanvas || !yoloCameraStream) { showYolo('Open camera first.'); return; }
+    const w = yoloCamera.videoWidth || 1280, h = yoloCamera.videoHeight || 720;
+    yoloCaptureCanvas.width = w; yoloCaptureCanvas.height = h;
+    const ctx = yoloCaptureCanvas.getContext('2d');
+    ctx.drawImage(yoloCamera, 0, 0, w, h);
+    yoloImageDataUrl = yoloCaptureCanvas.toDataURL('image/jpeg', 0.92);
+    drawYoloCanvas(yoloImageDataUrl, []);
+    showYolo('Frame captured — click Run Detection.');
+  });
+
+  btnYoloClose?.addEventListener('click', () => { stopYoloCamera(); showYolo('Camera closed.'); });
+
+  btnYoloModels?.addEventListener('click', refreshYoloModels);
+
+  btnYoloClear?.addEventListener('click', () => {
+    yoloImageDataUrl = '';
+    if (yoloImage) yoloImage.value = '';
+    if (yoloCanvas) { yoloCanvas.classList.add('d-none'); }
+    if (yoloNoImage) { yoloNoImage.classList.remove('d-none'); }
+    if (yoloDetList) yoloDetList.innerHTML = '<span class="text-muted">(run detection to see results)</span>';
+    stopYoloCamera();
+    setYoloBadge('idle', 'text-bg-secondary');
+    showYolo('(no YOLO request yet)');
+  });
+
+  btnYoloDetect?.addEventListener('click', async () => {
+    if (!yoloImageDataUrl) { showYolo('Select or capture an image first.'); return; }
+    btnYoloDetect.disabled = true;
+    setYoloBadge('detecting…', 'text-bg-warning');
+    showYolo('Sending image to YOLO service...');
+    try {
+      const r = await fetch('/api/admin/yolo/detect', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image_data_url:      yoloImageDataUrl,
+          model:               (yoloModel?.value || 'yolov11s').trim(),
+          confidence_threshold: parseFloat(yoloThreshold?.value || '0.5'),
+          max_detections:      parseInt(yoloMaxDet?.value || '20', 10),
+        })
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        setYoloBadge('error', 'text-bg-danger');
+        showYolo(j);
+        return;
+      }
+      const dets   = j.detections || [];
+      const mode   = j.backend_mode ? ` [${j.backend_mode}]` : '';
+      const timing = Number.isFinite(j.elapsed_ms) ? ` · ${j.elapsed_ms.toFixed(1)} ms` : '';
+      setYoloBadge(`${dets.length} detected${mode}${timing}`, dets.length ? 'text-bg-success' : 'text-bg-secondary');
+      drawYoloCanvas(yoloImageDataUrl, dets);
+      renderYoloList(dets, j.elapsed_ms);
+      showYolo(`Model: ${j.model || '?'} · ${dets.length} object(s) detected${timing}${mode}\n\n${JSON.stringify(j, null, 2)}`);
+    } finally {
+      btnYoloDetect.disabled = false;
+    }
+  });
+
+  // ── end YOLO panel ────────────────────────────────────────────────────────
+
   await refreshServices();
   await refreshHailoMode();
   await refreshRobotCatalog();
-  window.addEventListener('beforeunload', stopCamera);
+  window.addEventListener('beforeunload', () => { stopCamera(); stopYoloCamera(); });
 })();
 </script>
 {% endblock %}
