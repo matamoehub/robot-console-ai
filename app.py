@@ -117,6 +117,25 @@ SLACK_EXECUTION_MODE = (os.environ.get("SLACK_EXECUTION_MODE", "test").strip() o
 ROBOT_BRAIN_AUDIT_LOG = Path(
     os.environ.get("ROBOT_BRAIN_AUDIT_LOG", "/opt/robot/logs/robot-brain-actions.log")
 ).expanduser()
+YOLO_API_BASE_URL = (os.environ.get("YOLO_API_BASE_URL", "http://127.0.0.1:8091").strip() or "http://127.0.0.1:8091")
+YOLO_SERVICE_UNIT_NAME = (os.environ.get("YOLO_SERVICE_NAME", "yolo-service").strip() or "yolo-service")
+YOLO_DEFAULT_ROBOT_ID = (os.environ.get("YOLO_DEFAULT_ROBOT_ID") or "").strip()
+# Vision rules: list of dicts with keys: class, min_confidence, action, arguments, cooldown_s
+# Default rules trigger on common classroom/lab detections.
+_YOLO_VISION_RULES_DEFAULT = [
+    {"class": "person",    "min_confidence": 0.7, "action": "say",     "arguments": {"text": "Hello! I can see a person."},  "cooldown_s": 15.0},
+    {"class": "stop sign", "min_confidence": 0.6, "action": "allstop", "arguments": {},                                       "cooldown_s": 5.0},
+    {"class": "cat",       "min_confidence": 0.7, "action": "say",     "arguments": {"text": "I see a cat!"},                 "cooldown_s": 15.0},
+    {"class": "dog",       "min_confidence": 0.7, "action": "say",     "arguments": {"text": "I see a dog!"},                 "cooldown_s": 15.0},
+]
+try:
+    _raw_rules = (os.environ.get("YOLO_VISION_RULES_JSON") or "").strip()
+    YOLO_VISION_RULES = json.loads(_raw_rules) if _raw_rules else _YOLO_VISION_RULES_DEFAULT
+except Exception:
+    YOLO_VISION_RULES = _YOLO_VISION_RULES_DEFAULT
+# Cooldown tracking: keyed by "robot_id:class" → last trigger monotonic time
+_vision_event_last: Dict[str, float] = {}
+_vision_event_lock = threading.Lock()
 PASS_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
 ROBOT_BRAIN_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
 ADMIN_USER = os.environ.get("RCAI_USER", "admin").strip() or "admin"
@@ -152,6 +171,15 @@ DEFAULT_AI_SERVICES = [
         "description": "Optional browser UI that talks to the Ollama backend.",
         "journal_unit": os.environ.get("OPEN_WEBUI_SERVICE", "open-webui").strip() or "open-webui",
         "control_script": os.environ.get("OPEN_WEBUI_CONTROL_SCRIPT", "").strip(),
+    },
+    {
+        "key": "yolo-service",
+        "label": "YOLO Service",
+        "service_name": os.environ.get("YOLO_SERVICE_NAME", "yolo-service").strip() or "yolo-service",
+        "health_url": os.environ.get("YOLO_HEALTH_URL", "http://127.0.0.1:8091/healthz").strip(),
+        "description": "Hailo-accelerated YOLO object detection service.",
+        "journal_unit": os.environ.get("YOLO_SERVICE_NAME", "yolo-service").strip() or "yolo-service",
+        "control_script": os.environ.get("YOLO_CONTROL_SCRIPT", "").strip(),
     },
 ]
 
@@ -1399,6 +1427,123 @@ def _voice_command_from_request(
     return result
 
 
+def _yolo_detect_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _http_json_request("POST", f"{YOLO_API_BASE_URL.rstrip('/')}/v1/detect", payload=payload, timeout=BACKEND_TIMEOUT if (BACKEND_TIMEOUT := 60.0) else 60.0)
+
+
+def _yolo_models() -> Dict[str, Any]:
+    return _http_json_request("GET", f"{YOLO_API_BASE_URL.rstrip('/')}/v1/models", timeout=10.0)
+
+
+def _process_vision_detections(
+    detections: List[Dict[str, Any]],
+    robot_id: str = "",
+    mode: str = "test",
+) -> Dict[str, Any]:
+    """Match YOLO detections against vision rules and optionally execute robot actions.
+
+    Each rule is evaluated against every detection.  A rule fires when:
+      - detection["class"] matches rule["class"] (case-insensitive)
+      - detection["confidence"] >= rule["min_confidence"]
+      - the cooldown for this (robot_id, class) pair has elapsed
+
+    In test mode the actions are described but not executed.
+    In live mode the matching robot action is executed immediately.
+    """
+    robots = _robot_registry()
+    target_robot_id = robot_id or YOLO_DEFAULT_ROBOT_ID
+    now = time.monotonic()
+
+    triggered: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    seen_classes: set = set()
+
+    for detection in detections:
+        det_class = str(detection.get("class") or "").strip().lower()
+        confidence = float(detection.get("confidence") or 0.0)
+
+        matched_rule: Optional[Dict[str, Any]] = None
+        for rule in YOLO_VISION_RULES:
+            rule_class = str(rule.get("class") or "").strip().lower()
+            min_conf = float(rule.get("min_confidence") or 0.5)
+            if det_class == rule_class and confidence >= min_conf:
+                matched_rule = rule
+                break
+
+        if matched_rule is None:
+            skipped.append({"detection": detection, "reason": "no_matching_rule"})
+            continue
+
+        # One trigger per class per call (avoid duplicate actions for multiple
+        # detections of the same class in a single frame).
+        if det_class in seen_classes:
+            skipped.append({"detection": detection, "reason": "duplicate_class_in_frame"})
+            continue
+        seen_classes.add(det_class)
+
+        cooldown_s = float(matched_rule.get("cooldown_s") or 0.0)
+        cooldown_key = f"{target_robot_id}:{det_class}"
+        with _vision_event_lock:
+            last_ts = _vision_event_last.get(cooldown_key, 0.0)
+            if now - last_ts < cooldown_s:
+                remaining = round(cooldown_s - (now - last_ts), 1)
+                skipped.append({"detection": detection, "reason": "cooldown", "remaining_s": remaining})
+                continue
+            if mode == "live":
+                _vision_event_last[cooldown_key] = now
+
+        action = str(matched_rule.get("action") or "unknown")
+        arguments = dict(matched_rule.get("arguments") or {})
+
+        trigger_info: Dict[str, Any] = {
+            "detection": detection,
+            "rule": matched_rule,
+            "action": action,
+            "arguments": arguments,
+            "robot_id": target_robot_id,
+        }
+
+        if mode == "test":
+            trigger_info["result"] = {"ok": True, "preview_only": True, "message": "test mode — no action taken"}
+            triggered.append(trigger_info)
+            continue
+
+        # Live execution: build a minimal parsed intent and call the executor.
+        target_robots = [r for r in robots if str(r.get("id") or "") == target_robot_id]
+        if not target_robots:
+            trigger_info["result"] = {"ok": False, "error": "target_robot_not_found"}
+            triggered.append(trigger_info)
+            continue
+
+        parsed = {
+            "target_scope": "single",
+            "target_robot_id": target_robot_id,
+            "intent": {"action": action, "executable": True, "arguments": arguments, "summary": f"vision: {det_class}"},
+            "text": f"vision event: {det_class}",
+            "steps": [],
+        }
+        exec_result = _execute_robot_intent(parsed)
+        trigger_info["result"] = exec_result
+        triggered.append(trigger_info)
+
+    result = {
+        "ok": True,
+        "mode": mode,
+        "robot_id": target_robot_id,
+        "detections_received": len(detections),
+        "triggered": triggered,
+        "skipped": skipped,
+        "triggered_count": len(triggered),
+    }
+    _audit_robot_action("vision_event", {
+        "robot_id": target_robot_id,
+        "mode": mode,
+        "detections_received": len(detections),
+        "triggered_count": len(triggered),
+    })
+    return result
+
+
 def _hailo_ollama_models() -> Dict[str, Any]:
     return _http_json_request("GET", f"{HAILO_OLLAMA_API_BASE_URL.rstrip('/')}/hailo/v1/list", timeout=20.0)
 
@@ -1815,6 +1960,100 @@ def api_admin_vlm_caption():
         result = _vlm_caption_request(payload)
         result["mode"] = mode
     return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.get("/api/admin/yolo/models")
+@need_login
+def api_admin_yolo_models():
+    """List YOLO models available on the YOLO service."""
+    result = _yolo_models()
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/admin/yolo/detect")
+@need_login
+def api_admin_yolo_detect():
+    """Run YOLO object detection on an uploaded or path-referenced image.
+
+    Accepts:
+      image_data_url  — data:image/jpeg;base64,… (from browser file input)
+      image_path      — absolute path on the server
+      confidence_threshold — float 0–1, default 0.5
+      max_detections       — int, default 20
+    """
+    body = request.get_json(silent=True) or {}
+    confidence_threshold = float(body.get("confidence_threshold") or 0.5)
+    max_detections = int(body.get("max_detections") or 20)
+
+    image_data_url = str(body.get("image_data_url") or "").strip()
+    image_path = str(body.get("image_path") or "").strip()
+
+    payload: Dict[str, Any] = {
+        "model": str(body.get("model") or os.environ.get("HAILO_YOLO_MODEL", "yolov11s")).strip(),
+        "confidence_threshold": confidence_threshold,
+        "max_detections": max_detections,
+    }
+
+    if image_data_url:
+        # data URL → base64 + mime type
+        if "," in image_data_url:
+            header, b64 = image_data_url.split(",", 1)
+            mime_type = "image/jpeg"
+            if ":" in header and ";" in header:
+                mime_type = header.split(":", 1)[1].split(";", 1)[0].strip()
+            payload["image_base64"] = b64
+            payload["image_mime_type"] = mime_type
+        else:
+            payload["image_base64"] = image_data_url
+    elif image_path:
+        payload["image_path"] = image_path
+    else:
+        return jsonify({"ok": False, "error": "missing_image_data_url_or_image_path"}), 400
+
+    result = _yolo_detect_request(payload)
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/brain/vision/event")
+def api_brain_vision_event():
+    """Receive YOLO detections from any source and trigger robot actions.
+
+    This is the machine API for wiring live YOLO output into the robot brain.
+    The YOLO service, a camera daemon, or any detection pipeline can POST
+    detections here to trigger robot responses based on the configured vision
+    rules (YOLO_VISION_RULES_JSON).
+
+    Requires Bearer token (ROBOT_BRAIN_API_TOKEN).
+
+    Request body:
+      {
+        "robot_id":        "Mata01",        # robot to command (or YOLO_DEFAULT_ROBOT_ID)
+        "detections":      [...],           # list of detection dicts from /v1/detect
+        "execution_mode":  "test"|"live"    # default: test
+      }
+
+    Response:
+      {
+        "ok": true,
+        "mode": "test",
+        "detections_received": 2,
+        "triggered": [...],
+        "skipped": [...],
+        "triggered_count": 1
+      }
+    """
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    robot_id = str(body.get("robot_id") or YOLO_DEFAULT_ROBOT_ID or "").strip()
+    detections = body.get("detections")
+    if not isinstance(detections, list):
+        return jsonify({"ok": False, "error": "detections must be a list"}), 400
+    mode = str(body.get("execution_mode") or body.get("mode") or "test").strip().lower()
+    if mode not in {"test", "live"}:
+        return jsonify({"ok": False, "error": "execution_mode must be test or live"}), 400
+    result = _process_vision_detections(detections, robot_id=robot_id, mode=mode)
+    return jsonify(result), (200 if result.get("ok") else 500)
 
 
 @APP.get("/api/admin/robot-control/catalog")

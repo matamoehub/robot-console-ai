@@ -1,0 +1,17 @@
+[Unit]
+Description=Matamoe Robot YOLO Object Detection Service (Hailo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=matamoe
+WorkingDirectory=/opt/robot/robot-console-ai
+EnvironmentFile=-/opt/robot/robot-console-ai/.env
+ExecStart=/opt/robot/robot-console-ai/.venv/bin/python3 /opt/robot/robot-console-ai/app_yolo.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
