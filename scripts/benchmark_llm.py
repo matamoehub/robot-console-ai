@@ -110,7 +110,18 @@ def tokens_per_second(response: dict[str, Any]) -> float | None:
     return eval_count / (eval_duration / 1e9)
 
 
+WARMUP_PROMPT = "Hello."
+WARMUP_TIMEOUT = 300.0  # first request loads the model into RAM/NPU; can be slow
+
+
 def run_target(target: dict[str, str], prompts: list[dict[str, str]]) -> dict[str, Any]:
+    print(f"  [{target['name']}] warming up...")
+    warmup = ollama_chat(target["base_url"], target["model"], WARMUP_PROMPT, timeout=WARMUP_TIMEOUT)
+    if warmup["ok"]:
+        print(f"  [{target['name']}] warm-up ok ({round(warmup['elapsed_s'], 2)}s)")
+    else:
+        print(f"  [{target['name']}] warm-up FAILED, timed prompts may include load time: {warmup.get('error')}")
+
     results = []
     for p in prompts:
         r = ollama_chat(target["base_url"], target["model"], p["prompt"])
@@ -135,12 +146,19 @@ def run_target(target: dict[str, str], prompts: list[dict[str, str]]) -> dict[st
         print(f"  [{target['name']}] {p['key']}: {'ok' if r['ok'] else 'FAIL'} ({entry['elapsed_s']}s{tps_note})")
         if not r["ok"]:
             print(f"    error: {entry['error']}")
-    return {"target": target["name"], "model": target["model"], "base_url": target["base_url"], "results": results}
+    return {
+        "target": target["name"],
+        "model": target["model"],
+        "base_url": target["base_url"],
+        "warmup_ok": warmup["ok"],
+        "warmup_s": round(warmup["elapsed_s"], 2),
+        "results": results,
+    }
 
 
 def summarize(all_results: list[dict[str, Any]]) -> None:
-    print("\n=== Summary ===")
-    print(f"{'Target':<28} {'OK':<8} {'Avg tok/s':<12} {'Avg latency (s)':<16}")
+    print("\n=== Summary (warm-up excluded) ===")
+    print(f"{'Target':<28} {'Warm-up (s)':<12} {'OK':<8} {'Avg tok/s':<12} {'Avg latency (s)':<16}")
     for entry in all_results:
         oks = [r for r in entry["results"] if r["ok"]]
         tps_values = [r["tokens_per_second"] for r in oks if r.get("tokens_per_second")]
@@ -148,7 +166,8 @@ def summarize(all_results: list[dict[str, Any]]) -> None:
         avg_tps = round(statistics.mean(tps_values), 2) if tps_values else "n/a"
         avg_latency = round(statistics.mean(latencies), 2) if latencies else "n/a"
         ok_ratio = f"{len(oks)}/{len(entry['results'])}"
-        print(f"{entry['target']:<28} {ok_ratio:<8} {str(avg_tps):<12} {str(avg_latency):<16}")
+        warmup_note = str(entry.get("warmup_s", "n/a")) if entry.get("warmup_ok") else "FAILED"
+        print(f"{entry['target']:<28} {warmup_note:<12} {ok_ratio:<8} {str(avg_tps):<12} {str(avg_latency):<16}")
 
 
 def main() -> int:
