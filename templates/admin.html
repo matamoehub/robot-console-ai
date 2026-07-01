@@ -71,10 +71,17 @@
           <div class="col-12 col-lg-4">
             <label class="form-label" for="llmModel">Model</label>
             <select id="llmModel" class="form-select">
-              <option value="qwen2.5-instruct:1.5b">qwen2.5-instruct:1.5b</option>
-              <option value="qwen2:1.5b" selected>qwen2:1.5b</option>
-              <option value="llama3.2:3b">llama3.2:3b</option>
+              <optgroup label="Hailo NPU (hailo-ollama)">
+                <option value="qwen2.5-instruct:1.5b" data-backend="hailo">qwen2.5-instruct:1.5b</option>
+                <option value="qwen2:1.5b" data-backend="hailo" selected>qwen2:1.5b</option>
+                <option value="llama3.2:3b" data-backend="hailo">llama3.2:3b</option>
+              </optgroup>
+              <optgroup label="CPU (ollama)">
+                <option value="gemma3:4b" data-backend="cpu">gemma3:4b</option>
+                <option value="gemma4:e2b-it-qat" data-backend="cpu">gemma4:e2b-it-qat</option>
+              </optgroup>
             </select>
+            <div class="form-text">CPU models run on the ARM cores via plain ollama, not the Hailo NPU.</div>
           </div>
           <div class="col-12 col-lg-5">
             <label class="form-label" for="llmPrompt">Prompt</label>
@@ -392,6 +399,37 @@
     });
   }
 
+  function setLlmModelOptions(select, groups) {
+    if (!select) return;
+    const previous = select.value || '';
+    select.innerHTML = '';
+    let any = false;
+    (groups || []).forEach((group) => {
+      if (!(group.models || []).length) return;
+      any = true;
+      const optgroup = document.createElement('optgroup');
+      optgroup.label = group.label;
+      group.models.forEach((model) => {
+        const opt = document.createElement('option');
+        opt.value = model;
+        opt.textContent = model;
+        opt.dataset.backend = group.backend;
+        optgroup.appendChild(opt);
+      });
+      select.appendChild(optgroup);
+    });
+    if (!any) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No models available';
+      select.appendChild(opt);
+      return;
+    }
+    if (previous && Array.from(select.options).some((opt) => opt.value === previous)) {
+      select.value = previous;
+    }
+  }
+
   function setRobotOptions(select, robots) {
     if (!select) return;
     const previous = select.value || '';
@@ -487,20 +525,32 @@
     if (btnCloseCamera) btnCloseCamera.disabled = true;
   }
 
+  async function fetchLlmModels(backend) {
+    try {
+      const r = await fetch(`/api/admin/llm/models?backend=${encodeURIComponent(backend)}`, { credentials: 'same-origin', cache: 'no-store' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) return { ok: false, models: [], raw: j };
+      return { ok: true, models: extractLlmModels(j), raw: j };
+    } catch (err) {
+      return { ok: false, models: [], raw: { error: String(err) } };
+    }
+  }
+
   async function refreshLlmModels() {
     showLlm('Loading models...');
-    const r = await fetch('/api/admin/llm/models', { credentials: 'same-origin', cache: 'no-store' });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || !j.ok) {
-      showLlm(j);
-      return;
+    const [hailo, cpu] = await Promise.all([fetchLlmModels('hailo'), fetchLlmModels('cpu')]);
+    setLlmModelOptions(llmModel, [
+      { label: 'Hailo NPU (hailo-ollama)', backend: 'hailo', models: hailo.models },
+      { label: 'CPU (ollama)', backend: 'cpu', models: cpu.models },
+    ]);
+    const allModels = [...hailo.models, ...cpu.models];
+    if (llmModel && (!llmModel.value || !allModels.includes(llmModel.value))) {
+      llmModel.value = pickPreferredModel(allModels, ['qwen2.5-instruct:1.5b', 'qwen2:1.5b', 'llama3.2:3b', 'gemma3:4b', 'gemma4:e2b-it-qat']);
     }
-    const models = extractLlmModels(j);
-    setModelOptions(llmModel, models);
-    if (llmModel && (!llmModel.value || !models.includes(llmModel.value))) {
-      llmModel.value = pickPreferredModel(models, ['qwen2.5-instruct:1.5b', 'qwen2:1.5b', 'llama3.2:3b']);
-    }
-    showLlm(models.length ? `Loaded models: ${models.join(', ')}` : j);
+    const lines = [];
+    lines.push(hailo.models.length ? `Hailo: ${hailo.models.join(', ')}` : `Hailo: ${hailo.ok ? 'no models installed' : 'unreachable'}`);
+    lines.push(cpu.models.length ? `CPU: ${cpu.models.join(', ')}` : `CPU: ${cpu.ok ? 'no models installed' : 'unreachable (is `ollama serve` running?)'}`);
+    showLlm(lines.join('\n'));
   }
 
   async function refreshVlmModels() {
@@ -684,6 +734,7 @@
   btnLlmAsk?.addEventListener('click', async () => {
     const prompt = (llmPrompt?.value || '').trim();
     const model = (llmModel?.value || '').trim();
+    const backend = llmModel?.selectedOptions?.[0]?.dataset?.backend || 'hailo';
     const maxTokens = Math.max(1, Math.min(512, Number(llmMaxTokens?.value || 48) || 48));
     const shortAnswer = !!llmShortAnswer?.checked;
     if (!prompt) {
@@ -695,13 +746,13 @@
       return;
     }
     btnLlmAsk.disabled = true;
-    showLlm('Sending prompt to LLM...');
+    showLlm(`Sending prompt to ${backend === 'cpu' ? 'CPU ollama' : 'Hailo NPU'}...`);
     try {
       const r = await fetch('/api/admin/llm/chat', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, prompt, max_tokens: maxTokens, short_answer: shortAnswer })
+        body: JSON.stringify({ model, backend, prompt, max_tokens: maxTokens, short_answer: shortAnswer })
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j.ok) {
