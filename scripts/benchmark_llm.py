@@ -14,6 +14,7 @@ admin app, so no login/session is needed):
     python3 scripts/benchmark_llm.py --backend cpu
     python3 scripts/benchmark_llm.py --model gemma3:4b --model qwen2:1.5b
     python3 scripts/benchmark_llm.py --output /tmp/llm_bench.json
+    python3 scripts/benchmark_llm.py --timeout 900
 
 Backend URLs default to the same env vars the app uses
 (HAILO_OLLAMA_API_BASE_URL, CPU_OLLAMA_API_BASE_URL) so no extra
@@ -84,7 +85,10 @@ PROMPTS: list[dict[str, str]] = [
 ]
 
 
-def ollama_chat(base_url: str, model: str, prompt: str, timeout: float = 120.0) -> dict[str, Any]:
+DEFAULT_TIMEOUT = 600.0  # generous: unbounded CPU generation on a Pi can be slow
+
+
+def ollama_chat(base_url: str, model: str, prompt: str, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     url = base_url.rstrip("/") + "/api/chat"
     payload = {
         "model": model,
@@ -111,12 +115,13 @@ def tokens_per_second(response: dict[str, Any]) -> float | None:
 
 
 WARMUP_PROMPT = "Hello."
-WARMUP_TIMEOUT = 300.0  # first request loads the model into RAM/NPU; can be slow
 
 
-def run_target(target: dict[str, str], prompts: list[dict[str, str]]) -> dict[str, Any]:
+def run_target(target: dict[str, str], prompts: list[dict[str, str]], timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     print(f"  [{target['name']}] warming up...")
-    warmup = ollama_chat(target["base_url"], target["model"], WARMUP_PROMPT, timeout=WARMUP_TIMEOUT)
+    # Cold model load (into RAM for CPU ollama, onto the NPU for hailo-ollama)
+    # can take longer than a single generation call, so give it extra room.
+    warmup = ollama_chat(target["base_url"], target["model"], WARMUP_PROMPT, timeout=max(timeout, DEFAULT_TIMEOUT))
     if warmup["ok"]:
         print(f"  [{target['name']}] warm-up ok ({round(warmup['elapsed_s'], 2)}s)")
     else:
@@ -124,7 +129,7 @@ def run_target(target: dict[str, str], prompts: list[dict[str, str]]) -> dict[st
 
     results = []
     for p in prompts:
-        r = ollama_chat(target["base_url"], target["model"], p["prompt"])
+        r = ollama_chat(target["base_url"], target["model"], p["prompt"], timeout=timeout)
         entry: dict[str, Any] = {"prompt_key": p["key"], "ok": r["ok"], "elapsed_s": round(r["elapsed_s"], 2)}
         if r["ok"]:
             resp = r["response"]
@@ -175,6 +180,13 @@ def main() -> int:
     parser.add_argument("--backend", choices=["hailo", "cpu", "all"], default="all", help="Which backend(s) to test.")
     parser.add_argument("--model", action="append", help="Restrict to specific model tag(s); repeatable.")
     parser.add_argument("--output", help="Write full JSON results to this path.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"Per-request timeout in seconds, including warm-up (default: {DEFAULT_TIMEOUT:.0f}). "
+        "Raise this further for larger CPU models on a loaded Pi.",
+    )
     args = parser.parse_args()
 
     targets = DEFAULT_TARGETS
@@ -190,7 +202,7 @@ def main() -> int:
     all_results = []
     for target in targets:
         print(f"\nRunning {target['name']} at {target['base_url']}...")
-        all_results.append(run_target(target, PROMPTS))
+        all_results.append(run_target(target, PROMPTS, timeout=args.timeout))
 
     summarize(all_results)
 

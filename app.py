@@ -9,6 +9,7 @@ import os
 import secrets
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -88,6 +89,9 @@ APP_UPDATE_SCRIPT = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_SCRIPT", "/opt/
 APP_RESTART_SCRIPT = Path(os.environ.get("ROBOT_CONSOLE_AI_RESTART_SCRIPT", "/opt/robot/bin/robot-console-ai-restart")).expanduser()
 UPDATE_TEST_LOG_PATH = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_TEST_LOG_PATH", "/tmp/robot-console-ai-update-tests.log")).expanduser()
 UPDATE_TEST_RC_PATH = Path(os.environ.get("ROBOT_CONSOLE_AI_UPDATE_TEST_RC_PATH", "/tmp/robot-console-ai-update-tests.rc")).expanduser()
+LLM_BENCHMARK_LOG_PATH = Path(os.environ.get("LLM_BENCHMARK_LOG_PATH", "/tmp/robot-console-ai-llm-benchmark.log")).expanduser()
+LLM_BENCHMARK_RC_PATH = Path(os.environ.get("LLM_BENCHMARK_RC_PATH", "/tmp/robot-console-ai-llm-benchmark.rc")).expanduser()
+LLM_BENCHMARK_JSON_PATH = Path(os.environ.get("LLM_BENCHMARK_JSON_PATH", "/tmp/robot-console-ai-llm-benchmark.json")).expanduser()
 PASS_HASH_FILE = Path(os.environ.get("PASS_HASH_FILE", "/opt/robot/etc/robot-console-ai.passhash")).expanduser()
 HAILO_OLLAMA_SERVICE_NAME = os.environ.get("HAILO_OLLAMA_SERVICE", "hailo-ollama").strip() or "hailo-ollama"
 VLM_SERVICE_UNIT_NAME = os.environ.get("VLM_SERVICE_NAME", "vlm-service").strip() or "vlm-service"
@@ -427,6 +431,56 @@ def _start_tests_only_detached(repo_dir: Path) -> Dict[str, Any]:
         return {"ok": True, "queued": True, "pid": p.pid, "cmd": "sh -lc <tests-only-script>"}
     except Exception as exc:
         return {"ok": False, "queued": False, "error": str(exc), "cmd": "sh -lc <tests-only-script>"}
+
+
+_LLM_BENCHMARK_PID: int | None = None
+
+
+def _llm_benchmark_running() -> bool:
+    global _LLM_BENCHMARK_PID
+    if _LLM_BENCHMARK_PID is None:
+        return False
+    try:
+        os.kill(_LLM_BENCHMARK_PID, 0)
+        return True
+    except OSError:
+        _LLM_BENCHMARK_PID = None
+        return False
+
+
+def _start_llm_benchmark_detached(backend: str, timeout: float) -> Dict[str, Any]:
+    global _LLM_BENCHMARK_PID
+    if _llm_benchmark_running():
+        return {"ok": False, "error": "benchmark_already_running", "pid": _LLM_BENCHMARK_PID}
+    script_path = APP_DIR / "scripts" / "benchmark_llm.py"
+    if not script_path.exists():
+        return {"ok": False, "error": "benchmark_script_missing", "path": str(script_path)}
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--backend", backend,
+        "--timeout", str(timeout),
+        "--output", str(LLM_BENCHMARK_JSON_PATH),
+    ]
+    q_cmd = " ".join(shlex.quote(x) for x in cmd)
+    q_log = shlex.quote(str(LLM_BENCHMARK_LOG_PATH))
+    q_rc = shlex.quote(str(LLM_BENCHMARK_RC_PATH))
+    q_json = shlex.quote(str(LLM_BENCHMARK_JSON_PATH))
+    script = (
+        "set +e; "
+        f"rm -f {q_rc} {q_json}; : > {q_log}; "
+        f"echo '$ {q_cmd}' >> {q_log}; "
+        f"{q_cmd} >> {q_log} 2>&1; "
+        "brc=$?; "
+        f"echo \"$brc\" > {q_rc}; "
+        "exit 0"
+    )
+    try:
+        p = subprocess.Popen(["sh", "-lc", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        _LLM_BENCHMARK_PID = p.pid
+        return {"ok": True, "queued": True, "pid": p.pid, "cmd": q_cmd}
+    except Exception as exc:
+        return {"ok": False, "queued": False, "error": str(exc), "cmd": q_cmd}
 
 
 def _service_health(url: str) -> Dict[str, Any]:
@@ -2039,6 +2093,52 @@ def api_admin_llm_chat():
             result["mode"] = mode
     result["request"] = {"model": model, "backend": backend, "max_tokens": max_tokens, "short_answer": short_answer}
     return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/admin/llm/benchmark/start")
+@need_login
+@csrf_protect
+def api_admin_llm_benchmark_start():
+    body = request.get_json(silent=True) or {}
+    backend = str(body.get("backend") or "all").strip().lower()
+    if backend not in {"all", "hailo", "cpu"}:
+        return jsonify({"ok": False, "error": "unsupported_backend"}), 400
+    try:
+        timeout = float(body.get("timeout") or 600.0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_timeout"}), 400
+    timeout = max(30.0, min(timeout, 3600.0))
+    result = _start_llm_benchmark_detached(backend, timeout)
+    return jsonify(result), (200 if result.get("ok") else (409 if result.get("error") == "benchmark_already_running" else 500))
+
+
+@APP.get("/api/admin/llm/benchmark/status")
+@need_login
+def api_admin_llm_benchmark_status():
+    rc = -1
+    try:
+        rc = int((LLM_BENCHMARK_RC_PATH.read_text() or "-1").strip())
+    except Exception:
+        rc = -1
+
+    started = LLM_BENCHMARK_RC_PATH.exists() or LLM_BENCHMARK_LOG_PATH.exists()
+    done = started and rc != -1
+    results = None
+    if done:
+        try:
+            results = json.loads(LLM_BENCHMARK_JSON_PATH.read_text())
+        except Exception:
+            results = None
+
+    return jsonify({
+        "ok": True,
+        "started": started,
+        "running": started and not done,
+        "done": done,
+        "returncode": None if rc == -1 else rc,
+        "log_tail": _tail_text(LLM_BENCHMARK_LOG_PATH, max_lines=200),
+        "results": results,
+    })
 
 
 @APP.get("/api/admin/vlm/models")

@@ -105,6 +105,28 @@
       </div>
     </div>
   </div>
+  <div class="col-12 col-xl-4">
+    <div class="card h-100">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <div class="fw-semibold">LLM Benchmark</div>
+          <span id="benchmarkStatusBadge" class="mode-pill inactive">Idle</span>
+        </div>
+        <label class="form-label" for="benchmarkBackend">Backend</label>
+        <select id="benchmarkBackend" class="form-select">
+          <option value="all" selected>All (Hailo + CPU)</option>
+          <option value="hailo">Hailo NPU only</option>
+          <option value="cpu">CPU only</option>
+        </select>
+        <div class="form-text mt-2">Runs the full prompt battery (with a warm-up) per model. This can take several minutes per model and keeps running on the server even if you leave this page — click Refresh Status to check back later.</div>
+        <div class="mt-3 d-flex gap-2 flex-wrap">
+          <button id="btnBenchmarkRun" class="btn btn-primary btn-sm" type="button">Run Benchmark</button>
+          <button id="btnBenchmarkRefresh" class="btn btn-outline-secondary btn-sm" type="button">Refresh Status</button>
+        </div>
+        <pre id="benchmarkOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap; max-height: 320px; overflow-y: auto;">(no benchmark run yet)</pre>
+      </div>
+    </div>
+  </div>
   <div class="col-12">
     <div class="card">
       <div class="card-body">
@@ -267,6 +289,11 @@
   const llmOut = document.getElementById('llmOut');
   const btnLlmAsk = document.getElementById('btnLlmAsk');
   const btnLlmModels = document.getElementById('btnLlmModels');
+  const benchmarkBackend = document.getElementById('benchmarkBackend');
+  const benchmarkStatusBadge = document.getElementById('benchmarkStatusBadge');
+  const benchmarkOut = document.getElementById('benchmarkOut');
+  const btnBenchmarkRun = document.getElementById('btnBenchmarkRun');
+  const btnBenchmarkRefresh = document.getElementById('btnBenchmarkRefresh');
   const vlmModel = document.getElementById('vlmModel');
   const vlmPrompt = document.getElementById('vlmPrompt');
   const vlmImage = document.getElementById('vlmImage');
@@ -292,6 +319,16 @@
   let cameraStream = null;
   let currentHailoMode = 'unknown';
   let lastParsedRobotCommand = null;
+  let benchmarkPollTimer = null;
+  let csrfTokenCache = null;
+
+  async function getCsrfToken() {
+    if (csrfTokenCache) return csrfTokenCache;
+    const r = await fetch('/api/admin/csrf-token', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    csrfTokenCache = j.csrf_token || '';
+    return csrfTokenCache;
+  }
 
   function show(v) {
     if (!out) return;
@@ -770,6 +807,93 @@
       btnLlmAsk.disabled = false;
     }
   });
+
+  function showBenchmark(v) {
+    if (!benchmarkOut) return;
+    benchmarkOut.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  }
+
+  function setBenchmarkBadge(text, className) {
+    if (!benchmarkStatusBadge) return;
+    benchmarkStatusBadge.textContent = text;
+    benchmarkStatusBadge.className = `mode-pill ${className}`;
+  }
+
+  function formatBenchmarkSummary(results) {
+    if (!Array.isArray(results) || !results.length) return '';
+    const lines = ['', '=== Summary (warm-up excluded) ==='];
+    for (const entry of results) {
+      const oks = (entry.results || []).filter((r) => r.ok);
+      const tpsValues = oks.map((r) => r.tokens_per_second).filter((v) => typeof v === 'number');
+      const latencies = oks.map((r) => r.elapsed_s).filter((v) => typeof v === 'number');
+      const avgTps = tpsValues.length ? (tpsValues.reduce((a, b) => a + b, 0) / tpsValues.length).toFixed(2) : 'n/a';
+      const avgLatency = latencies.length ? (latencies.reduce((a, b) => a + b, 0) / latencies.length).toFixed(2) : 'n/a';
+      const warmup = entry.warmup_ok ? `${entry.warmup_s}s` : 'FAILED';
+      lines.push(`${entry.target}: warm-up ${warmup}, ${oks.length}/${(entry.results || []).length} ok, avg ${avgTps} tok/s, avg ${avgLatency}s latency`);
+    }
+    return lines.join('\n');
+  }
+
+  function renderBenchmarkStatus(data) {
+    if (!data || data.ok === false) {
+      setBenchmarkBadge('Error', 'inactive');
+      showBenchmark(data || 'Failed to load benchmark status.');
+      return;
+    }
+    if (!data.started) {
+      setBenchmarkBadge('Idle', 'inactive');
+      showBenchmark('(no benchmark run yet)');
+      return;
+    }
+    if (data.running) {
+      setBenchmarkBadge('Running…', 'active-vlm');
+    } else if (data.done && data.returncode === 0) {
+      setBenchmarkBadge('Done', 'active-llm');
+    } else if (data.done) {
+      setBenchmarkBadge(`Failed (rc ${data.returncode})`, 'inactive');
+    }
+    const summary = data.done ? formatBenchmarkSummary(data.results) : '';
+    showBenchmark(`${data.log_tail || '(no output yet)'}${summary}`);
+  }
+
+  async function fetchBenchmarkStatus() {
+    const r = await fetch('/api/admin/llm/benchmark/status', { credentials: 'same-origin', cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    renderBenchmarkStatus(j);
+    if (j && j.running) {
+      if (!benchmarkPollTimer) benchmarkPollTimer = setInterval(fetchBenchmarkStatus, 4000);
+    } else if (benchmarkPollTimer) {
+      clearInterval(benchmarkPollTimer);
+      benchmarkPollTimer = null;
+    }
+    return j;
+  }
+
+  btnBenchmarkRun?.addEventListener('click', async () => {
+    btnBenchmarkRun.disabled = true;
+    setBenchmarkBadge('Starting…', 'active-vlm');
+    showBenchmark('Starting benchmark... this can take several minutes per model.');
+    try {
+      const token = await getCsrfToken();
+      const r = await fetch('/api/admin/llm/benchmark/start', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+        body: JSON.stringify({ backend: benchmarkBackend?.value || 'all' })
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok && j.error !== 'benchmark_already_running') {
+        setBenchmarkBadge('Error', 'inactive');
+        showBenchmark(j);
+        return;
+      }
+      await fetchBenchmarkStatus();
+    } finally {
+      btnBenchmarkRun.disabled = false;
+    }
+  });
+
+  btnBenchmarkRefresh?.addEventListener('click', () => fetchBenchmarkStatus());
 
   vlmImage?.addEventListener('change', async () => {
     const file = vlmImage.files && vlmImage.files[0];
@@ -1285,7 +1409,12 @@
   await refreshServices();
   await refreshHailoMode();
   await refreshRobotCatalog();
-  window.addEventListener('beforeunload', () => { stopCamera(); stopYoloCamera(); });
+  await fetchBenchmarkStatus();
+  window.addEventListener('beforeunload', () => {
+    stopCamera();
+    stopYoloCamera();
+    if (benchmarkPollTimer) clearInterval(benchmarkPollTimer);
+  });
 })();
 </script>
 {% endblock %}
