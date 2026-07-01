@@ -39,6 +39,7 @@ DEFAULT_TARGETS: list[dict[str, str]] = [
     {"name": "hailo:qwen2.5-instruct:1.5b", "base_url": HAILO_BASE_URL, "model": "qwen2.5-instruct:1.5b"},
     {"name": "hailo:qwen2:1.5b", "base_url": HAILO_BASE_URL, "model": "qwen2:1.5b"},
     {"name": "hailo:llama3.2:3b", "base_url": HAILO_BASE_URL, "model": "llama3.2:3b"},
+    {"name": "cpu:gemma3:270m", "base_url": CPU_BASE_URL, "model": "gemma3:270m"},
     {"name": "cpu:gemma3:4b", "base_url": CPU_BASE_URL, "model": "gemma3:4b"},
     {"name": "cpu:gemma4:e2b-it-qat", "base_url": CPU_BASE_URL, "model": "gemma4:e2b-it-qat"},
 ]
