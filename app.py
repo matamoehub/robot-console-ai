@@ -112,6 +112,9 @@ ROBOT_REGISTRY_FILE = Path(
 ROBOT_TEXT_COMMAND_MODEL = (
     os.environ.get("ROBOT_TEXT_COMMAND_MODEL", "qwen2:1.5b").strip() or "qwen2:1.5b"
 )
+TTS_PIPER_CMD = (os.environ.get("TTS_PIPER_CMD") or "").strip()
+TTS_VOICE_MODEL = (os.environ.get("TTS_VOICE_MODEL") or "").strip()
+TTS_SYNTH_TIMEOUT = float(os.environ.get("TTS_SYNTH_TIMEOUT", "30").strip() or "30")
 ROBOT_BRAIN_API_TOKEN = (os.environ.get("ROBOT_BRAIN_API_TOKEN") or "").strip()
 if not ROBOT_BRAIN_API_TOKEN:
     import logging as _startup_log
@@ -839,6 +842,47 @@ def _stt_transcribe(audio_path: Path, *, prompt: str = "", language: str = "", m
     else:
         LOGGER.info("STT transcription complete elapsed_ms=%s text=%s", elapsed_ms, result["text"])
     return result
+
+
+def _tts_synth(text: str) -> Dict[str, Any]:
+    """Synthesise text to a WAV file using piper and return the path.
+
+    Returns {"ok": True, "wav_path": Path, "elapsed_ms": int}
+    or      {"ok": False, "error": str}.
+    """
+    if not TTS_PIPER_CMD:
+        return {"ok": False, "error": "tts_not_configured"}
+    if not text.strip():
+        return {"ok": False, "error": "empty_text"}
+    try:
+        import tempfile, shlex, time as _time
+        fd, wav_path = tempfile.mkstemp(prefix="robot-console-ai-tts-", suffix=".wav")
+        os.close(fd)
+        wav_path = Path(wav_path)
+        cmd = TTS_PIPER_CMD.format(
+            wav_path=shlex.quote(str(wav_path)),
+            voice=shlex.quote(TTS_VOICE_MODEL),
+        )
+        t0 = _time.monotonic()
+        proc = subprocess.run(
+            ["sh", "-lc", cmd],
+            input=text.encode(),
+            capture_output=True,
+            timeout=TTS_SYNTH_TIMEOUT,
+            check=False,
+        )
+        elapsed_ms = int((_time.monotonic() - t0) * 1000)
+        if proc.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size == 0:
+            LOGGER.error("TTS piper failed rc=%s stderr=%s", proc.returncode, proc.stderr[:200])
+            wav_path.unlink(missing_ok=True)
+            return {"ok": False, "error": "piper_failed", "returncode": proc.returncode}
+        LOGGER.info("TTS synth complete elapsed_ms=%s chars=%s", elapsed_ms, len(text))
+        return {"ok": True, "wav_path": wav_path, "elapsed_ms": elapsed_ms}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "tts_timeout"}
+    except Exception as exc:
+        LOGGER.exception("TTS synth error")
+        return {"ok": False, "error": str(exc)}
 
 
 def _compact_audit_value(value: Any, *, depth: int = 0) -> Any:
@@ -2473,6 +2517,101 @@ def api_brain_voice_command():
         result = {"ok": False, "error": str(e)}
     status = 200 if result.get("ok") else 503 if execute_live else 400
     return jsonify(_public_robot_response(result)), status
+
+
+@APP.post("/api/brain/stt")
+def api_brain_stt():
+    """Transcribe an audio file uploaded by a robot.
+
+    Accepts multipart/form-data with field ``audio`` (WAV/OGG/MP3 etc.) or
+    JSON with ``audio_b64`` (base64-encoded audio) + ``mime_type``.
+
+    Optional fields: ``language`` (default "en"), ``prompt``.
+
+    Requires Bearer token (ROBOT_BRAIN_API_TOKEN via Authorization header or
+    X-Robot-Brain-Token header).
+
+    Response: {"ok": true, "text": "...", "elapsed_ms": 123, "language": "en"}
+    """
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    audio_path, audio_error = _materialize_audio_payload(
+        request.get_json(silent=True) or {}
+    ) if request.content_type and "application/json" in request.content_type else (None, None)
+    if audio_path is None:
+        f = request.files.get("audio")
+        if f:
+            suffix = _stt_extension_for_mime(f.content_type or "")
+            import tempfile
+            fd, tmp = tempfile.mkstemp(prefix="robot-console-ai-audio-", suffix=suffix)
+            os.close(fd)
+            audio_path = Path(tmp)
+            f.save(str(audio_path))
+        else:
+            body = request.get_json(silent=True) or {}
+            audio_path, audio_error = _materialize_audio_payload(body)
+    if audio_path is None:
+        return jsonify({"ok": False, "error": audio_error or "missing_audio_field"}), 400
+    body = request.get_json(silent=True) or {}
+    language = str(request.form.get("language") or body.get("language") or "").strip()
+    prompt = str(request.form.get("prompt") or body.get("prompt") or "").strip()
+    normalized_audio_path: Optional[Path] = None
+    normalized_created = False
+    try:
+        normalized_audio_path, normalize_error, normalized_created = _normalize_audio_for_stt(audio_path)
+        if normalize_error or normalized_audio_path is None:
+            return jsonify({"ok": False, "error": normalize_error or "audio_normalization_failed"}), 400
+        if STT_USES_HAILO:
+            with HAILO_DEVICE_LOCK:
+                result = _stt_transcribe(normalized_audio_path, language=language, prompt=prompt)
+        else:
+            result = _stt_transcribe(normalized_audio_path, language=language, prompt=prompt)
+    finally:
+        try:
+            audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            if normalized_created and normalized_audio_path:
+                normalized_audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@APP.post("/api/brain/tts")
+def api_brain_tts():
+    """Synthesise text to WAV audio using piper and return the audio file.
+
+    Request body (JSON): {"text": "Hello robot."}
+
+    Requires Bearer token (ROBOT_BRAIN_API_TOKEN).
+
+    Response: WAV audio (audio/wav) on success, JSON error on failure.
+    """
+    if not _api_token_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "missing_text"}), 400
+    result = _tts_synth(text)
+    if not result.get("ok"):
+        return jsonify(result), 503
+    wav_path: Path = result["wav_path"]
+    try:
+        from flask import send_file
+        return send_file(
+            str(wav_path),
+            mimetype="audio/wav",
+            as_attachment=False,
+            download_name="tts.wav",
+        )
+    finally:
+        try:
+            wav_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 @APP.post("/api/brain/telegram/ingest")
