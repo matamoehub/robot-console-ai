@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import mimetypes
 import os
+import queue
 import secrets
 import shlex
 import subprocess
@@ -636,7 +637,24 @@ class _STTProcess:
                 raise RuntimeError("stt_backend_pipes_unavailable")
             proc.stdin.write(json.dumps(payload) + "\n")
             proc.stdin.flush()
-            line = proc.stdout.readline()
+
+            line_queue: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=1)
+
+            def _read_line(pipe: Any, q: "queue.Queue[Optional[str]]") -> None:
+                try:
+                    q.put(pipe.readline())
+                except Exception:
+                    q.put(None)
+
+            reader = threading.Thread(
+                target=_read_line, args=(proc.stdout, line_queue), daemon=True
+            )
+            reader.start()
+            try:
+                line = line_queue.get(timeout=timeout)
+            except queue.Empty:
+                line = None
+
             if not line:
                 stderr_text = ""
                 if proc.stderr is not None:
@@ -647,7 +665,16 @@ class _STTProcess:
                             stderr_text = proc.stderr.read(4096)
                     except Exception:
                         pass
+                # Same recovery path as the dead-process case: drop the
+                # reference so the next call spawns a fresh backend, and
+                # kill the wedged process so it doesn't linger.
                 self._proc = None
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                if line is None:
+                    raise RuntimeError(stderr_text.strip() or "stt_backend_timeout")
                 raise RuntimeError(stderr_text.strip() or "stt_backend_no_response")
             return json.loads(line)
 
@@ -685,7 +712,10 @@ def _materialize_audio_payload(body: Dict[str, Any]) -> tuple[Optional[Path], Op
     audio_path = str(body.get("audio_path") or "").strip()
     if audio_path:
         p = Path(audio_path).expanduser().resolve()
-        if not any(str(p).startswith(str(base)) for base in _AUDIO_PATH_ALLOWLIST):
+        if not any(
+            p == base or base in p.parents
+            for base in (b.resolve() for b in _AUDIO_PATH_ALLOWLIST)
+        ):
             return None, "audio_path_not_allowed"
         if not p.exists():
             return None, "audio_path_not_found"
