@@ -1,6 +1,6 @@
 import unittest
 
-from robot_brain import parse_text_command, parse_text_command_plan
+from robot_brain import build_llm_parser_prompt, parse_text_command, parse_text_command_plan
 
 
 ROBOTS = [
@@ -94,6 +94,49 @@ class RobotBrainParseTests(unittest.TestCase):
         self.assertTrue(result["intent"]["executable"])
         self.assertEqual(len(result["steps"]), 1)
         self.assertEqual(result["steps"][0]["intent"]["action"], "say")
+
+
+class BuildLlmParserPromptTests(unittest.TestCase):
+    """Regression coverage for the few-shot examples added to the LLM
+    fallback prompt. Note: build_llm_parser_prompt's output contract is a
+    single flat {action, target_scope, target_robot_id, arguments, summary}
+    object — it has no "steps" wrapper. Multi-step chained commands (e.g.
+    "wave then say hello") are split and parsed entirely by the rule-based
+    parse_text_command_plan() before the LLM is ever consulted; the LLM
+    prompt is only invoked as a single-action fallback on the *whole*
+    input text when the rule-based parser can't recognize anything at all
+    (see _parse_robot_text_request in app.py). So the "multi-step" example
+    below targets the eb0185f/18e7a35 bugs (filler text hijacking the
+    parsed action, and "and"/"then" inside a spoken `say` phrase getting
+    treated as a command separator) within that single-object contract,
+    rather than asserting a steps array the downstream code doesn't
+    consume.
+    """
+
+    def test_prompt_includes_single_step_examples(self):
+        prompt = build_llm_parser_prompt("say hello", ROBOTS, preferred_robot_id="Tony01")
+        self.assertIn('Text: "Tony01, say hello to the class"', prompt)
+        self.assertIn('"action": "say"', prompt)
+        self.assertIn('Text: "Stop every robot right now"', prompt)
+        self.assertIn('"action": "allstop", "target_scope": "fleet"', prompt)
+
+    def test_prompt_includes_filler_and_conjunction_guard_example(self):
+        # Regression for eb0185f ("Improve robot brain parsing for chained
+        # voice commands") and 18e7a35 ("Fix chained robot command
+        # parsing"): a leading non-command filler phrase must not hijack
+        # the parsed action, and "and"/"then" inside spoken text must not
+        # truncate arguments.text.
+        prompt = build_llm_parser_prompt("say hello", ROBOTS, preferred_robot_id="Tony01")
+        self.assertIn('Text: "This is a test. Tony01, say hello and welcome everyone"', prompt)
+        self.assertIn('"arguments": {"text": "hello and welcome everyone"}', prompt)
+        self.assertIn("filler, not a command", prompt)
+        self.assertIn("do not truncate arguments.text at", prompt)
+
+    def test_prompt_still_includes_allowlist_and_shape(self):
+        prompt = build_llm_parser_prompt("say hi", ROBOTS, preferred_robot_id="Mata01")
+        self.assertIn("Allowed actions:", prompt)
+        self.assertIn("Required JSON shape:", prompt)
+        self.assertIn("Examples:", prompt)
 
 
 if __name__ == "__main__":

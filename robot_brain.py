@@ -660,6 +660,20 @@ Rules:
 - For llm_service, set arguments.op to start or stop.
 - For catalog_only, set arguments.command to the library command name.
 - If unsure, use action=unknown.
+- Ignore filler phrases that aren't commands (e.g. "this is a test", "testing") — find the real command and parse only that.
+- Never split a single spoken phrase on "and"/"then" if those words fall inside the text being said out loud — keep arguments.text intact.
+
+Examples:
+
+Text: "Tony01, say hello to the class"
+JSON: {{"action": "say", "target_scope": "single", "target_robot_id": "Tony01", "arguments": {{"text": "hello to the class"}}, "summary": "Say 'hello to the class'"}}
+
+Text: "Stop every robot right now"
+JSON: {{"action": "allstop", "target_scope": "fleet", "target_robot_id": "", "arguments": {{}}, "summary": "Emergency stop all robots"}}
+
+Text: "This is a test. Tony01, say hello and welcome everyone"
+JSON: {{"action": "say", "target_scope": "single", "target_robot_id": "Tony01", "arguments": {{"text": "hello and welcome everyone"}}, "summary": "Say 'hello and welcome everyone'"}}
+(Note: the leading "This is a test." is filler, not a command — ignore it. The "and" inside the spoken text is part of what to say, not a command separator — do not truncate arguments.text at "and".)
 
 User text:
 {text}
