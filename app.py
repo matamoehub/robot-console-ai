@@ -1862,19 +1862,39 @@ def _wait_for_health(url: str, expect_ok: bool = True, timeout_s: float = 25.0) 
 
 
 def _switch_hailo_mode(target: str) -> Dict[str, Any]:
+    """Switch which service holds the Hailo NPU.
+
+    hailo-ollama (LLM) claims the physical device exclusively — it doesn't
+    participate in Hailo's shared-VDevice-group scheme the way VLM and YOLO
+    both do (SHARED_VDEVICE_GROUP_ID + round-robin scheduling), so it must
+    always be stopped before either of those can acquire the device. VLM and
+    YOLO are both designed to coexist with each other via that shared group,
+    so switching between them doesn't stop the other one.
+    """
     target = (target or "").strip().lower()
-    if target not in {"llm", "vlm"}:
+    if target not in {"llm", "vlm", "yolo"}:
         return {"ok": False, "error": "invalid_hailo_target"}
-    desired_service = HAILO_OLLAMA_SERVICE_NAME if target == "llm" else VLM_SERVICE_UNIT_NAME
-    other_service = VLM_SERVICE_UNIT_NAME if target == "llm" else HAILO_OLLAMA_SERVICE_NAME
-    desired_health = HAILO_OLLAMA_API_BASE_URL.rstrip("/") + "/hailo/v1/list" if target == "llm" else VLM_API_BASE_URL.rstrip("/") + "/healthz"
+
+    if target == "llm":
+        desired_service = HAILO_OLLAMA_SERVICE_NAME
+        other_services = [VLM_SERVICE_UNIT_NAME, YOLO_SERVICE_UNIT_NAME]
+        desired_health = HAILO_OLLAMA_API_BASE_URL.rstrip("/") + "/hailo/v1/list"
+    elif target == "vlm":
+        desired_service = VLM_SERVICE_UNIT_NAME
+        other_services = [HAILO_OLLAMA_SERVICE_NAME]
+        desired_health = VLM_API_BASE_URL.rstrip("/") + "/healthz"
+    else:  # yolo
+        desired_service = YOLO_SERVICE_UNIT_NAME
+        other_services = [HAILO_OLLAMA_SERVICE_NAME]
+        desired_health = YOLO_API_BASE_URL.rstrip("/") + "/healthz"
 
     with HAILO_DEVICE_LOCK:
         steps = []
-        stop_other = _systemctl_run(["stop", other_service], timeout=30.0)
-        steps.append({"service": other_service, "action": "stop", **stop_other})
-        if not stop_other.get("ok"):
-            return {"ok": False, "error": "stop_other_failed", "target": target, "steps": steps}
+        for other_service in other_services:
+            stop_other = _systemctl_run(["stop", other_service], timeout=30.0)
+            steps.append({"service": other_service, "action": "stop", **stop_other})
+            if not stop_other.get("ok"):
+                return {"ok": False, "error": "stop_other_failed", "target": target, "steps": steps}
 
         start_desired = _systemctl_run(["restart", desired_service], timeout=30.0)
         steps.append({"service": desired_service, "action": "restart", **start_desired})
@@ -1898,10 +1918,12 @@ _HAILO_MODE_TTL = 8.0  # seconds — mode only changes on an explicit admin swit
 def _hailo_mode_status_uncached() -> Dict[str, Any]:
     """Probe Hailo service state.
 
-    Runs the LLM and VLM _service_status calls in parallel (each does one HTTP
-    health check + one systemctl show).  This replaces the previous sequential
-    approach that made 4 I/O calls one after another and also called
-    _service_health() separately, resulting in duplicate HTTP requests.
+    Runs the LLM, VLM, and YOLO _service_status calls in parallel (each does
+    one HTTP health check + one systemctl show).  active_mode is the single
+    service name if exactly one of the three is healthy, "shared" if more
+    than one is (expected for vlm+yolo, which coexist via a shared VDevice
+    group; unexpected but tolerated for any combination involving llm, which
+    doesn't participate in that group), or "unknown" if none are.
     """
     llm_item = {
         "key": "hailo-ollama",
@@ -1917,25 +1939,38 @@ def _hailo_mode_status_uncached() -> Dict[str, Any]:
         "description": "",
         "health_url": f"{VLM_API_BASE_URL.rstrip('/')}/healthz",
     }
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+    yolo_item = {
+        "key": "yolo-service",
+        "label": "YOLO Service",
+        "service_name": YOLO_SERVICE_UNIT_NAME,
+        "description": "",
+        "health_url": f"{YOLO_API_BASE_URL.rstrip('/')}/healthz",
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
         f_llm = ex.submit(_service_status, llm_item)
         f_vlm = ex.submit(_service_status, vlm_item)
+        f_yolo = ex.submit(_service_status, yolo_item)
     llm_status = f_llm.result()
     vlm_status = f_vlm.result()
-    llm_health = llm_status.get("health", {})
-    vlm_health = vlm_status.get("health", {})
-    active_mode = "unknown"
-    if llm_health.get("ok") and not vlm_health.get("ok"):
-        active_mode = "llm"
-    elif vlm_health.get("ok") and not llm_health.get("ok"):
-        active_mode = "vlm"
-    elif llm_health.get("ok") and vlm_health.get("ok"):
+    yolo_status = f_yolo.result()
+    active_flags = {
+        "llm": bool(llm_status.get("health", {}).get("ok")),
+        "vlm": bool(vlm_status.get("health", {}).get("ok")),
+        "yolo": bool(yolo_status.get("health", {}).get("ok")),
+    }
+    active_names = [name for name, ok in active_flags.items() if ok]
+    if len(active_names) == 1:
+        active_mode = active_names[0]
+    elif len(active_names) > 1:
         active_mode = "shared"
+    else:
+        active_mode = "unknown"
     return {
         "ok": True,
         "active_mode": active_mode,
         "llm": llm_status,
         "vlm": vlm_status,
+        "yolo": yolo_status,
     }
 
 
@@ -2302,7 +2337,11 @@ def api_admin_yolo_detect():
     else:
         return jsonify({"ok": False, "error": "missing_image_data_url_or_image_path"}), 400
 
-    result = _yolo_detect_request(payload)
+    with HAILO_DEVICE_LOCK:
+        mode = _hailo_mode_status()
+        if mode.get("active_mode") not in {"yolo", "shared"}:
+            return jsonify({"ok": False, "error": "hailo_mode_not_yolo", "mode": mode}), 503
+        result = _yolo_detect_request(payload)
     if not result.get("ok"):
         return jsonify(result), 503
 

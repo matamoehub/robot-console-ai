@@ -27,6 +27,7 @@
         <div class="mt-2 d-flex gap-2 flex-wrap">
           <button id="btnModeLlm" class="btn btn-outline-dark btn-sm" type="button">Switch To LLM</button>
           <button id="btnModeVlm" class="btn btn-outline-dark btn-sm" type="button">Switch To VLM</button>
+          <button id="btnModeYolo" class="btn btn-outline-dark btn-sm" type="button">Switch To YOLO</button>
         </div>
         <pre id="adminOut" class="mono small mt-3 mb-0" style="white-space: pre-wrap;">(no action yet)</pre>
       </div>
@@ -180,7 +181,10 @@
       <div class="card-body">
         <div class="d-flex justify-content-between align-items-center mb-3">
           <div class="fw-semibold">YOLO Object Detection</div>
-          <span id="yoloStatusBadge" class="badge text-bg-secondary">idle</span>
+          <div class="d-flex gap-2">
+            <span id="yoloModeBadge" class="mode-pill inactive">YOLO idle</span>
+            <span id="yoloStatusBadge" class="badge text-bg-secondary">idle</span>
+          </div>
         </div>
         <div class="row g-3">
           <div class="col-12 col-lg-2">
@@ -280,10 +284,12 @@
   const hailoModeBadge = document.getElementById('hailoModeBadge');
   const llmModeBadge = document.getElementById('llmModeBadge');
   const vlmModeBadge = document.getElementById('vlmModeBadge');
+  const yoloModeBadge = document.getElementById('yoloModeBadge');
   const btnRunTests = document.getElementById('btnRunTests');
   const btnUpdateRestart = document.getElementById('btnUpdateRestart');
   const btnModeLlm = document.getElementById('btnModeLlm');
   const btnModeVlm = document.getElementById('btnModeVlm');
+  const btnModeYolo = document.getElementById('btnModeYolo');
   const llmModel = document.getElementById('llmModel');
   const llmPrompt = document.getElementById('llmPrompt');
   const llmMaxTokens = document.getElementById('llmMaxTokens');
@@ -352,6 +358,7 @@
       apply(hailoModeBadge, 'LLM active', 'active-llm');
       apply(llmModeBadge, 'LLM active', 'active-llm');
       apply(vlmModeBadge, 'VLM inactive', 'inactive');
+      apply(yoloModeBadge, 'YOLO inactive', 'inactive');
       syncModeAvailability();
       return;
     }
@@ -360,6 +367,16 @@
       apply(hailoModeBadge, 'VLM active', 'active-vlm');
       apply(llmModeBadge, 'LLM inactive', 'inactive');
       apply(vlmModeBadge, 'VLM active', 'active-vlm');
+      apply(yoloModeBadge, 'YOLO inactive', 'inactive');
+      syncModeAvailability();
+      return;
+    }
+    if (mode === 'yolo') {
+      apply(navModeBadge, 'Mode: YOLO', 'active-vlm');
+      apply(hailoModeBadge, 'YOLO active', 'active-vlm');
+      apply(llmModeBadge, 'LLM inactive', 'inactive');
+      apply(vlmModeBadge, 'VLM inactive', 'inactive');
+      apply(yoloModeBadge, 'YOLO active', 'active-vlm');
       syncModeAvailability();
       return;
     }
@@ -368,6 +385,7 @@
       apply(hailoModeBadge, 'Shared mode', 'active-llm');
       apply(llmModeBadge, 'LLM available', 'active-llm');
       apply(vlmModeBadge, 'VLM available', 'active-vlm');
+      apply(yoloModeBadge, 'YOLO available', 'active-vlm');
       syncModeAvailability();
       return;
     }
@@ -375,12 +393,14 @@
     apply(hailoModeBadge, 'Unknown', 'inactive');
     apply(llmModeBadge, 'LLM idle', 'inactive');
     apply(vlmModeBadge, 'VLM idle', 'inactive');
+    apply(yoloModeBadge, 'YOLO idle', 'inactive');
     syncModeAvailability();
   }
 
   function syncModeAvailability() {
     const llmEnabled = currentHailoMode === 'llm' || currentHailoMode === 'shared';
     const vlmEnabled = currentHailoMode === 'vlm' || currentHailoMode === 'shared';
+    const yoloEnabled = currentHailoMode === 'yolo' || currentHailoMode === 'shared';
 
     [llmModel, llmPrompt, llmMaxTokens, llmShortAnswer, btnLlmAsk, btnLlmModels].forEach((el) => {
       if (el) el.disabled = !llmEnabled;
@@ -390,6 +410,10 @@
       if (el) el.disabled = !vlmEnabled;
     });
 
+    [yoloModel, yoloThreshold, yoloMaxDet, yoloImage, btnYoloDetect, btnYoloModels, btnYoloClear, btnYoloOpen].forEach((el) => {
+      if (el) el.disabled = !yoloEnabled;
+    });
+
     if (!vlmEnabled) {
       if (btnCaptureCamera) btnCaptureCamera.disabled = true;
       if (btnCloseCamera) btnCloseCamera.disabled = true;
@@ -397,6 +421,15 @@
     } else if (cameraStream) {
       if (btnCaptureCamera) btnCaptureCamera.disabled = false;
       if (btnCloseCamera) btnCloseCamera.disabled = false;
+    }
+
+    if (!yoloEnabled) {
+      if (btnYoloCapture) btnYoloCapture.disabled = true;
+      if (btnYoloClose) btnYoloClose.disabled = true;
+      stopYoloCamera();
+    } else if (yoloCameraStream) {
+      if (btnYoloCapture) btnYoloCapture.disabled = false;
+      if (btnYoloClose) btnYoloClose.disabled = false;
     }
   }
 
@@ -1053,6 +1086,15 @@
       await switchHailoMode('vlm');
     } finally {
       btnModeVlm.disabled = false;
+    }
+  });
+
+  btnModeYolo?.addEventListener('click', async () => {
+    btnModeYolo.disabled = true;
+    try {
+      await switchHailoMode('yolo');
+    } finally {
+      btnModeYolo.disabled = false;
     }
   });
 
