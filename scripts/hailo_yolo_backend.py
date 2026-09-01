@@ -223,6 +223,7 @@ def _init_direct_context(model: str) -> Dict[str, Any]:
         InputVStreamParams,
         OutputVStreamParams,
         FormatType,
+        HailoStreamInterface,
     )
     from hailo_apps.python.core.common.defines import (  # type: ignore[import]
         HAILO10H_ARCH,
@@ -238,7 +239,7 @@ def _init_direct_context(model: str) -> Dict[str, Any]:
     params.group_id = SHARED_VDEVICE_GROUP_ID
     vdevice = VDevice(params)
     hef = HEF(str(hef_path))
-    configure_params = ConfigureParams.create_from_hef(hef, interface=None)
+    configure_params = ConfigureParams.create_from_hef(hef, HailoStreamInterface.PCIe)
     network_groups = vdevice.configure(hef, configure_params)
     network_group = network_groups[0]
 
