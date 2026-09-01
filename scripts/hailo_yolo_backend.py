@@ -230,7 +230,13 @@ def _init_direct_context(model: str) -> Dict[str, Any]:
     from hailo_apps.python.core.common.defines import HAILO10H_ARCH  # type: ignore[import]
     from hailo_apps.python.core.common.core import resolve_hef_path  # type: ignore[import]
 
-    hef_path = HAILO_YOLO_HEF_PATH or resolve_hef_path(None, app_name=model, arch=HAILO10H_ARCH)
+    # HAILO_YOLO_HEF_PATH is an override for HAILO_YOLO_MODEL specifically; it
+    # must not silently hijack every other model the caller asks for, or
+    # switching models in the admin UI would keep loading the same HEF.
+    if HAILO_YOLO_HEF_PATH and model == DEFAULT_MODEL:
+        hef_path = HAILO_YOLO_HEF_PATH
+    else:
+        hef_path = resolve_hef_path(None, app_name=model, arch=HAILO10H_ARCH)
     if not hef_path or not Path(str(hef_path)).exists():
         raise RuntimeError(f"YOLO HEF not found for model={model}. Set HAILO_YOLO_HEF_PATH.")
 
@@ -265,6 +271,11 @@ def _direct_detect(image_path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         if _DIRECT_CONTEXT is None or _DIRECT_CONTEXT.get("model") != model:
+            # Release the previous model's HailoInfer (VDevice + configured
+            # model) before configuring a new one on the same shared device —
+            # otherwise the stale connection is left dangling and the new
+            # inference can fail with "Communication closed failure".
+            _release_direct_context()
             _DIRECT_CONTEXT = _init_direct_context(model)
     except Exception as exc:
         return {"ok": False, "error": f"hailo_init_failed: {exc}"}
